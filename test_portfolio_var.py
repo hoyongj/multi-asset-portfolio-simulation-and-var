@@ -37,6 +37,29 @@ def synthetic_sources():
     return yields, etfs
 
 
+def synthetic_terminal_market():
+    """A non-flat curve and correlated factors, with more than 500 valid changes."""
+    dates = pd.bdate_range(end=pv.ANALYSIS_END, periods=530, name="Date").as_unit("ns")
+    rng = np.random.default_rng(731)
+    mixing = np.eye(8)
+    mixing[1:6, 0] = .7
+    mixing[6, 0], mixing[7, 6] = -.4, .5
+    scales = np.array([.00015] * 6 + [.006, .009])
+    changes = (rng.standard_normal((529, 8)) @ mixing.T) * scales
+    cumulative = np.vstack([np.zeros(8), changes.cumsum(axis=0)])
+    yields = pd.DataFrame(
+        (np.array([.025, .03, .035, .04, .045, .05]) + cumulative[:, :6]) * 100,
+        index=dates, columns=pv.YIELD_COLUMNS,
+    )
+    etfs = {}
+    for position, ticker in enumerate(pv.ETF_TICKERS):
+        adjusted = [80., 150.][position] * np.exp(cumulative[:, 6 + position])
+        etfs[ticker] = pd.DataFrame(
+            {"Close": adjusted * [1.25, 1.4][position], "Adj Close": adjusted}, index=dates
+        )
+    return pv.prepare_market_data(yields, etfs)
+
+
 class SyntheticTestCase(unittest.TestCase):
     def setUp(self):
         self.yields, self.etfs = synthetic_sources()
@@ -422,6 +445,238 @@ class RetrievalAndExecutionTests(SyntheticTestCase):
         self.assertIn("1,000,000.00", output.getvalue())
         self.assertIn("invariant to this scale", output.getvalue())
         self.assertIn("basis points", output.getvalue())
+
+
+class GaussianCalibrationTests(unittest.TestCase):
+    def setUp(self):
+        self.market = synthetic_terminal_market()
+        self.changes = self.market.risk_factor_changes
+
+    def test_latest_500_changes_and_sample_moments(self):
+        changes = self.changes.copy()
+        changes.iloc[0] = 999.
+        future = pd.DataFrame([np.full(8, 1e6)], index=pd.to_datetime(["2026-09-01"]),
+                              columns=pv.RISK_FACTOR_COLUMNS)
+        model = pv.calibrate_gaussian(pd.concat([future, changes]))
+        expected = self.changes.tail(500)
+        assert_frame_equal(model.sample, expected, check_freq=False)
+        assert_series_equal(model.mean, expected.mean(), check_names=False)
+        assert_series_equal(model.std, expected.std(ddof=1), check_names=False)
+        assert_frame_equal(model.sample_covariance, expected.cov(ddof=1))
+        self.assertEqual(model.sample.index[-1], pd.Timestamp("2026-08-31"))
+
+    def test_factor_order_and_eight_dimensional_covariance(self):
+        model = pv.calibrate_gaussian(self.changes.iloc[:, ::-1])
+        self.assertEqual(tuple(model.sample.columns), pv.RISK_FACTOR_COLUMNS)
+        self.assertEqual(tuple(model.mean.index), pv.RISK_FACTOR_COLUMNS)
+        self.assertEqual(tuple(model.std.index), pv.RISK_FACTOR_COLUMNS)
+        for covariance in (model.sample_covariance, model.covariance):
+            self.assertEqual(covariance.shape, (8, 8))
+            self.assertEqual(tuple(covariance.index), pv.RISK_FACTOR_COLUMNS)
+            self.assertEqual(tuple(covariance.columns), pv.RISK_FACTOR_COLUMNS)
+        factor = model.covariance_adjustment.factor
+        np.testing.assert_allclose(factor @ factor.T, model.covariance, atol=1e-18)
+        self.assertNotEqual(model.covariance.loc["SVENY01", "SVENY02"], 0.)
+
+    def test_explicit_cutoff_excludes_later_changes(self):
+        cutoff = self.changes.index[-10]
+        model = pv.calibrate_gaussian(self.changes, cutoff)
+        assert_frame_equal(model.sample, self.changes.loc[:cutoff].tail(500), check_freq=False)
+        self.assertEqual(model.cutoff_date, cutoff)
+
+    def test_insufficient_incomplete_and_invalid_calibration_fail(self):
+        with self.assertRaisesRegex(pv.DataValidationError, "500"):
+            pv.calibrate_gaussian(self.changes.tail(499))
+        incomplete = self.changes.copy()
+        incomplete.iloc[-1, 0] = np.nan
+        with self.assertRaisesRegex(pv.DataValidationError, "aligned and complete"):
+            pv.calibrate_gaussian(incomplete)
+        for changes in (self.changes.drop(columns="SVENY09"), self.changes.assign(EXTRA=0.)):
+            with self.assertRaisesRegex(pv.DataValidationError, "eight specified"):
+                pv.calibrate_gaussian(changes)
+        with self.assertRaises(pv.DataValidationError):
+            pv.calibrate_gaussian(self.changes, "2026-09-01")
+
+
+class CovarianceAndGeneratorTests(unittest.TestCase):
+    def test_psd_and_singular_covariances_need_no_jitter(self):
+        for covariance in (np.zeros((8, 8)), np.diag([1., 1e-18, 0.])):
+            result = pv.stabilize_covariance(covariance)
+            np.testing.assert_array_equal(result.covariance, covariance)
+            np.testing.assert_allclose(result.factor @ result.factor.T, covariance, atol=1e-32)
+            self.assertEqual(result.clipped_eigenvalues, 0)
+            self.assertEqual(result.correction_frobenius_norm, 0.)
+
+    def test_only_tiny_negative_eigenvalues_are_clipped(self):
+        epsilon = np.finfo(float).eps
+        result = pv.stabilize_covariance(np.diag([1., -epsilon]))
+        np.testing.assert_array_equal(result.covariance, np.diag([1., 0.]))
+        self.assertEqual(result.clipped_eigenvalues, 1)
+        self.assertEqual(result.original_min_eigenvalue, -epsilon)
+        self.assertGreaterEqual(result.tolerance, epsilon)
+        self.assertAlmostEqual(result.correction_frobenius_norm / epsilon, 1.)
+
+    def test_roundoff_asymmetry_is_averaged_and_material_defects_fail(self):
+        epsilon = np.finfo(float).eps
+        covariance = np.array([[1., .2], [.2 + epsilon, 2.]])
+        result = pv.stabilize_covariance(covariance)
+        np.testing.assert_array_equal(result.covariance, covariance / 2 + covariance.T / 2)
+        self.assertLessEqual(result.correction_frobenius_norm, epsilon)
+        for covariance in ([[1., 2.], [2., 1.]], [[1., .2], [.3, 1.]], [[np.nan]], [1., 2.]):
+            with self.subTest(covariance=covariance), self.assertRaises(pv.DataValidationError):
+                pv.stabilize_covariance(covariance)
+
+    def test_generators_reproduce_and_separate_all_four_purposes(self):
+        draws = {}
+        for purpose in pv.RANDOM_STREAM_NAMES:
+            draws[purpose] = pv.create_rng(purpose).normal(size=10)
+            np.testing.assert_array_equal(draws[purpose], pv.create_rng(purpose).normal(size=10))
+        self.assertEqual(len({tuple(values) for values in draws.values()}), 4)
+        pv.create_rng("standalone_terminal_simulation").normal(size=100)
+        np.testing.assert_array_equal(draws["correlated_terminal_simulation"],
+                                      pv.create_rng("correlated_terminal_simulation").normal(size=10))
+        with self.assertRaises(ValueError):
+            pv.create_rng("unknown")
+
+
+class TerminalSimulationTests(unittest.TestCase):
+    def setUp(self):
+        self.market = synthetic_terminal_market()
+        self.model = pv.calibrate_gaussian(self.market.risk_factor_changes)
+        self.date = self.market.levels.index[-1]
+        self.allocation = pv.allocate_portfolio(self.market.levels, self.date)
+        self.path_count = 12
+
+    def simulations(self, model=None, master_seed=pv.MASTER_SEED):
+        return tuple(function(
+            self.model if model is None else model, self.allocation, self.market.levels,
+            path_count=self.path_count, master_seed=master_seed,
+        ) for function in (pv.simulate_standalone_terminal, pv.simulate_correlated_terminal))
+
+    def test_exact_path_horizon_and_factor_dimensions(self):
+        for result, factors in zip(self.simulations(),
+                                   (pv.STANDALONE_FACTOR_COLUMNS, pv.RISK_FACTOR_COLUMNS)):
+            self.assertEqual(result.daily_changes.shape, (self.path_count * 252, len(factors)))
+            self.assertEqual(tuple(result.daily_changes.columns), factors)
+            self.assertEqual(result.paths.shape, (self.path_count, 19))
+            self.assertEqual(result.horizon_days, 252)
+            self.assertEqual(result.daily_changes.index.names, ["path", "day"])
+            self.assertEqual(tuple(result.daily_changes.index.levels[1]), tuple(range(1, 253)))
+            self.assertTrue((result.daily_changes.groupby(level="path").size() == 252).all())
+            self.assertTrue((result.summary["count"] == self.path_count).all())
+        self.assertEqual(pv.SIMULATION_PATHS, 10_000)
+        self.assertEqual(pv.TRADING_DAYS, 252)
+
+    def test_reproducible_paths_and_distinct_purpose_streams(self):
+        first, second = self.simulations(), self.simulations()
+        changed = self.simulations(master_seed=43)
+        for original, repeated, different in zip(first, second, changed):
+            assert_frame_equal(original.daily_changes, repeated.daily_changes)
+            assert_frame_equal(original.paths, repeated.paths)
+            assert_frame_equal(original.summary, repeated.summary)
+            self.assertFalse(original.paths.equals(different.paths))
+            self.assertEqual(original.seed, pv.CHILD_SEEDS[original.purpose])
+        self.assertNotEqual(first[0].seed, first[1].seed)
+        self.assertFalse(first[0].daily_changes["LQD"].equals(first[1].daily_changes["LQD"]))
+
+    def test_terminal_maturities_and_full_repricing_for_each_path(self):
+        row = self.market.levels.loc[self.date]
+        for result in self.simulations():
+            np.testing.assert_array_equal(result.terminal_maturities, [1., 4., 9.])
+            cumulative = result.daily_changes.groupby(level="path").sum()
+            for holding, terminal_tenor, initial_tenor in zip(pv.TREASURY_HOLDINGS, (1, 4, 9), (2, 5, 10)):
+                factor = f"SVENY{terminal_tenor:02d}"
+                terminal_yield = row[factor] + cumulative[factor]
+                expected_price = np.exp(-terminal_yield * terminal_tenor)
+                initial_price = math.exp(-row[f"SVENY{initial_tenor:02d}"] * initial_tenor)
+                np.testing.assert_allclose(result.terminal_yields[factor], terminal_yield)
+                np.testing.assert_allclose(result.paths[holding, "unit_price"], expected_price)
+                np.testing.assert_allclose(result.paths[holding, "value"],
+                                           expected_price * self.allocation.treasury_face_quantities[holding])
+                np.testing.assert_allclose(result.paths[holding, "return"], expected_price / initial_price - 1)
+                self.assertAlmostEqual(result.initial_unit_prices[holding], initial_price)
+        correlated = self.simulations()[1]
+        self.assertEqual(tuple(correlated.terminal_yields.columns), pv.YIELD_COLUMNS)
+
+    def test_zero_shocks_preserve_initial_prices_and_apply_curve_roll_down(self):
+        zeros = pd.DataFrame(0., index=self.model.sample.index, columns=pv.RISK_FACTOR_COLUMNS)
+        model = pv.calibrate_gaussian(zeros)
+        for result in self.simulations(model=model):
+            np.testing.assert_array_equal(result.daily_changes, 0.)
+            for holding, terminal_column, maturity in zip(pv.TREASURY_HOLDINGS,
+                                                         pv.TERMINAL_YIELD_COLUMNS, (1., 4., 9.)):
+                expected = math.exp(-self.market.levels.loc[self.date, terminal_column] * maturity)
+                np.testing.assert_allclose(result.paths[holding, "unit_price"], expected)
+                np.testing.assert_allclose(result.paths[holding, "return"],
+                                           expected / result.initial_unit_prices[holding] - 1)
+            for ticker in pv.ETF_TICKERS:
+                np.testing.assert_allclose(result.paths[ticker, "value"], self.allocation.initial_holding_values[ticker])
+
+    def test_etf_adjusted_prices_equivalent_unit_prices_and_log_returns(self):
+        for result in self.simulations():
+            cumulative = result.daily_changes.groupby(level="path").sum()
+            for ticker in pv.ETF_TICKERS:
+                ratio = np.exp(cumulative[ticker])
+                np.testing.assert_allclose(result.paths[ticker, "adjusted_price"],
+                                           self.allocation.initial_etf_adj_close[ticker] * ratio)
+                np.testing.assert_allclose(result.paths[ticker, "unit_price"],
+                                           self.allocation.initial_etf_close[ticker] * ratio)
+                np.testing.assert_allclose(result.paths[ticker, "return"], ratio - 1)
+
+    def test_fixed_quantities_finite_results_and_portfolio_reconciliation(self):
+        expected_quantities = pd.concat([self.allocation.treasury_face_quantities,
+                                         self.allocation.etf_shares]).reindex(pv.HOLDINGS)
+        before = expected_quantities.copy()
+        for result in self.simulations():
+            assert_series_equal(result.quantities, expected_quantities, check_names=False)
+            for holding in pv.HOLDINGS:
+                np.testing.assert_allclose(result.paths[holding, "value"] / result.paths[holding, "unit_price"],
+                                           expected_quantities[holding])
+            holding_values = result.paths.loc[:, [(holding, "value") for holding in pv.HOLDINGS]]
+            np.testing.assert_allclose(result.paths["Portfolio", "value"], holding_values.sum(axis=1))
+            np.testing.assert_allclose(result.paths["Portfolio", "return"],
+                                       holding_values.sum(axis=1) / self.allocation.initial_value - 1)
+            self.assertTrue(np.isfinite(result.paths.to_numpy()).all())
+            self.assertTrue(np.isfinite(result.summary.to_numpy()).all())
+            self.assertTrue(np.isfinite(result.terminal_yields.to_numpy()).all())
+        after = pd.concat([self.allocation.treasury_face_quantities,
+                           self.allocation.etf_shares]).reindex(pv.HOLDINGS)
+        assert_series_equal(before, after)
+
+    def test_correlated_draws_preserve_estimated_dependence(self):
+        result = self.simulations()[1]
+        standardized = (result.daily_changes - self.model.mean) / self.model.std
+        expected = self.model.covariance.to_numpy() / np.outer(self.model.std, self.model.std)
+        np.testing.assert_allclose(standardized.cov().to_numpy(), expected, atol=.09, rtol=0.)
+
+    def test_orchestration_and_explicit_allocation_date(self):
+        result = pv.run_terminal_analysis(self.market, path_count=4)
+        self.assertEqual(len(result.calibration.sample), 500)
+        self.assertEqual(result.correlated.allocation.allocation_date, self.date)
+        self.assertIs(result.correlated.allocation, result.standalone.allocation)
+        earlier = self.market.levels.index[-5]
+        result = pv.run_terminal_analysis(self.market, earlier, path_count=4)
+        self.assertEqual(result.calibration.sample.index[-1], earlier)
+        self.assertEqual(result.correlated.allocation.allocation_date, earlier)
+
+    def test_invalid_path_counts_and_future_calibration_fail(self):
+        for function in (pv.simulate_standalone_terminal, pv.simulate_correlated_terminal):
+            for count in (0, -1, 1.5, True):
+                with self.assertRaises(pv.DataValidationError):
+                    function(self.model, self.allocation, self.market.levels, path_count=count)
+            earlier = pv.allocate_portfolio(self.market.levels, self.market.levels.index[-2])
+            with self.assertRaisesRegex(pv.DataValidationError, "after the allocation"):
+                function(self.model, earlier, self.market.levels, path_count=4)
+
+    def test_executable_terminal_option_reports_in_memory_summaries(self):
+        analysis = pv.run_terminal_analysis(self.market, path_count=4)
+        output = io.StringIO()
+        with patch("portfolio_var.retrieve_market_data", return_value=self.market), \
+                patch("portfolio_var.run_terminal_analysis", return_value=analysis), redirect_stdout(output):
+            self.assertEqual(pv.main(["--terminal"]), 0)
+        self.assertIn("500 aligned changes", output.getvalue())
+        self.assertIn("correlated_terminal_simulation: 4 paths, 252 trading days", output.getvalue())
+        self.assertIn("Covariance correction:", output.getvalue())
 
 
 if __name__ == "__main__":

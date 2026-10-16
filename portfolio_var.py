@@ -1,4 +1,4 @@
-"""Data and pricing foundation for the approved multi-asset portfolio brief.
+"""Data, pricing, and Gaussian terminal simulation for the approved project brief.
 
 Sources: Federal Reserve fitted zero-coupon yields (SVENY, percentage units,
 continuously compounded), and Yahoo Finance ETF prices accessed via yfinance.
@@ -22,8 +22,15 @@ Explicit elapsed_years can instead express a simulation horizon: 252 modeled
 trading days / 252 = 1 year, leaving maturities of 1, 4, and 9 years. Yields
 are linearly interpolated in maturity; extrapolation outside 1--10 is rejected.
 
-Importing does not retrieve data, seed global random state, or write files.
-Executing retrieves and reports this foundation in memory; it writes no outputs.
+Gaussian calibration uses the latest 500 common-date changes through the chosen
+allocation date, capped at 2026-08-31. Means, sample standard deviations, and sample
+covariance use the same observations (ddof=1). Daily draws are IID through time.
+Standalone draws are independent marginal analyses; their summed portfolio is an
+independence diagnostic. The portfolio analysis uses the full eight-factor model.
+
+Importing does not retrieve data, seed global random state, or write analysis files.
+Executing reports the foundation; --terminal also simulates terminal distributions.
+All paths, summaries, and numerical covariance corrections remain in memory.
 """
 
 from __future__ import annotations
@@ -59,6 +66,14 @@ BACKTEST_FORECASTS = 250
 VAR_CONFIDENCE = 0.99
 TRADING_DAYS = 252
 SIMULATION_PATHS = 10_000
+RISK_FACTOR_COLUMNS = YIELD_COLUMNS + ETF_TICKERS
+TERMINAL_HORIZON_YEARS = TRADING_DAYS / TRADING_DAYS
+TERMINAL_MATURITIES = tuple(maturity - TERMINAL_HORIZON_YEARS for maturity in INITIAL_MATURITIES)
+TERMINAL_YIELD_COLUMNS = tuple(f"SVENY{int(tenor):02d}" for tenor in TERMINAL_MATURITIES)
+STANDALONE_FACTOR_COLUMNS = TERMINAL_YIELD_COLUMNS + ETF_TICKERS
+ESTIMATION_DDOF = 1
+PSD_ROUNDOFF_MULTIPLIER = 10.0
+SUMMARY_PERCENTILES = (0.01, 0.5, 0.99)
 CALENDAR_DAYS_PER_YEAR = 365.0
 BASIS_POINTS_PER_DECIMAL = 10_000.0
 MASTER_SEED = 42
@@ -103,6 +118,18 @@ def create_child_seeds(master_seed: int = MASTER_SEED) -> dict[str, int]:
 
 
 CHILD_SEEDS = MappingProxyType(create_child_seeds())
+
+
+def create_rng(purpose: str, master_seed: int = MASTER_SEED) -> np.random.Generator:
+    """Create a fresh reproducible stream, including reserved VaR/attribution streams.
+
+    Consumption in one purpose never advances another purpose's generator.
+    Reproducibility assumes the same pinned numerical libraries/build.
+    """
+    seeds = create_child_seeds(master_seed)
+    if purpose not in seeds:
+        raise ValueError(f"Unknown random stream {purpose!r}; expected {tuple(seeds)}")
+    return np.random.default_rng(seeds[purpose])
 
 
 @dataclass(frozen=True)
@@ -157,6 +184,66 @@ class PortfolioAllocation:
     etf_shares: pd.Series
     initial_etf_close: pd.Series
     initial_etf_adj_close: pd.Series
+
+
+@dataclass(frozen=True)
+class CovarianceAdjustment:
+    """Covariance used for simulation and the complete numerical correction record."""
+
+    covariance: np.ndarray
+    factor: np.ndarray
+    original_min_eigenvalue: float
+    tolerance: float
+    clipped_eigenvalues: int
+    correction_frobenius_norm: float
+
+
+@dataclass(frozen=True)
+class GaussianCalibration:
+    """Eight ordered Gaussian marginals and joint covariance from one 500-row sample."""
+
+    cutoff_date: pd.Timestamp
+    sample: pd.DataFrame
+    mean: pd.Series
+    std: pd.Series
+    sample_covariance: pd.DataFrame
+    covariance: pd.DataFrame
+    covariance_adjustment: CovarianceAdjustment
+
+
+@dataclass(frozen=True)
+class TerminalSimulation:
+    """Daily changes and terminal results, without filesystem output.
+
+    daily_changes has (path, day) rows. paths has one row per path and (holding,
+    metric) columns. unit_price is per USD 1 Treasury face or per initial ETF
+    share (initial Close times the adjusted-price ratio). adjusted_price separately
+    records each ETF's simulated allocation-date Adj Close times that ratio.
+    value and return are holding dollars and simple returns; Portfolio has their
+    sum and total return. summary describes each metric and records its initial
+    value. The standalone Portfolio sum assumes independent marginal draws.
+    """
+
+    purpose: str
+    seed: int
+    horizon_days: int
+    allocation: PortfolioAllocation
+    quantities: pd.Series
+    initial_unit_prices: pd.Series
+    terminal_maturities: pd.Series
+    daily_changes: pd.DataFrame
+    terminal_yields: pd.DataFrame
+    paths: pd.DataFrame
+    summary: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class TerminalAnalysis:
+    """Common calibration with standalone and correlated terminal results."""
+
+    calibration: GaussianCalibration
+    standalone: TerminalSimulation
+    correlated: TerminalSimulation
 
 
 def _as_date(value: object, label: str) -> pd.Timestamp:
@@ -514,16 +601,246 @@ def holding_values(
     return pd.concat([bonds, etfs]).reindex(HOLDINGS).rename("USD")
 
 
+def stabilize_covariance(covariance: object) -> CovarianceAdjustment:
+    """Factor a PSD covariance, correcting only floating-point roundoff.
+
+    Symmetry and negative-eigenvalue tolerances are 10 * n * machine epsilon
+    times the matrix/eigenvalue scale, respectively. Material asymmetry or
+    indefiniteness fails. Average roundoff asymmetry, then clip only negative
+    eigenvalues within tolerance to zero: this is the smallest Frobenius-norm
+    PSD correction of the symmetric matrix. No diagonal jitter, positive
+    eigenvalue floor, shrinkage, or statistical regularization is applied.
+    Eigen factor A simulates mean + z @ A.T, including singular covariances.
+    https://numpy.org/doc/stable/reference/generated/numpy.linalg.eigh.html
+    """
+    original = _real_array(covariance, "covariance")
+    if original.ndim != 2 or original.shape[0] != original.shape[1] or not original.size:
+        raise DataValidationError("covariance must be a nonempty square matrix")
+    relative_tolerance = PSD_ROUNDOFF_MULTIPLIER * len(original) * np.finfo(float).eps
+    scale = float(np.max(np.abs(original)))
+    if np.max(np.abs(original - original.T)) > relative_tolerance * scale:
+        raise DataValidationError("Covariance has material asymmetry")
+    symmetric = original / 2 + original.T / 2
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+    except np.linalg.LinAlgError as exc:
+        raise DataValidationError("Covariance eigen decomposition failed") from exc
+    tolerance = relative_tolerance * float(np.max(np.abs(eigenvalues)))
+    if eigenvalues[0] < -tolerance:
+        raise DataValidationError("Covariance is materially indefinite; numerical repair refused")
+    negative_count = int(np.count_nonzero(eigenvalues < 0))
+    clipped = np.maximum(eigenvalues, 0.0)
+    factor = eigenvectors * np.sqrt(clipped)
+    corrected = factor @ factor.T if negative_count else symmetric
+    return CovarianceAdjustment(
+        corrected, factor, float(eigenvalues[0]), tolerance, negative_count,
+        float(np.linalg.norm(corrected - original, ord="fro")),
+    )
+
+
+def calibrate_gaussian(
+    aligned_changes: pd.DataFrame, valuation_date: object = ANALYSIS_END
+) -> GaussianCalibration:
+    """Fit all eight factors on exactly the latest 500 aligned changes by cutoff.
+
+    Input units are decimal-yield changes and adjusted-price log returns. Sample
+    std/covariance use ddof=1 consistently. Missing changes fail rather than being
+    filled or silently removed. Changes after the inclusive cutoff are excluded.
+    """
+    cutoff = _as_date(valuation_date, "valuation_date")
+    if not _as_date(ANALYSIS_START, "start") <= cutoff <= _as_date(ANALYSIS_END, "end"):
+        raise DataValidationError("Calibration cutoff must be within the analysis period")
+    if not isinstance(aligned_changes, pd.DataFrame) or set(aligned_changes.columns) != set(RISK_FACTOR_COLUMNS):
+        raise DataValidationError("Calibration requires exactly the eight specified risk factors")
+    changes, _ = validate_source_frame(
+        aligned_changes, RISK_FACTOR_COLUMNS, "calibration", ANALYSIS_START, cutoff
+    )
+    if changes.isna().any().any():
+        raise DataValidationError("Calibration changes must already be aligned and complete")
+    if len(changes) < CALIBRATION_WINDOW:
+        raise DataValidationError(f"Calibration requires {CALIBRATION_WINDOW} aligned daily changes")
+    sample = changes.tail(CALIBRATION_WINDOW).copy()
+    mean = sample.mean().rename("daily_mean")
+    std = sample.std(ddof=ESTIMATION_DDOF).rename("daily_std")
+    sample_covariance = sample.cov(ddof=ESTIMATION_DDOF)
+    adjustment = stabilize_covariance(sample_covariance.to_numpy())
+    used_covariance = pd.DataFrame(
+        adjustment.covariance, index=RISK_FACTOR_COLUMNS, columns=RISK_FACTOR_COLUMNS
+    )
+    return GaussianCalibration(
+        cutoff, sample, mean, std, sample_covariance, used_covariance, adjustment
+    )
+
+
+def _simulate_terminal(
+    calibration: GaussianCalibration,
+    allocation: PortfolioAllocation,
+    levels: pd.DataFrame,
+    purpose: str,
+    path_count: int,
+    master_seed: int,
+) -> TerminalSimulation:
+    if isinstance(path_count, (bool, np.bool_)) or not isinstance(path_count, (int, np.integer)) or path_count <= 0:
+        raise DataValidationError("path_count must be a positive integer")
+    stamp, row = _valuation_row(levels, allocation.allocation_date)
+    if stamp > _as_date(ANALYSIS_END, "end"):
+        raise DataValidationError("Allocation must not exceed the analysis end date")
+    if calibration.sample.index[-1] > stamp:
+        raise DataValidationError("Calibration uses changes after the allocation date")
+    correlated = purpose == "correlated_terminal_simulation"
+    factors = RISK_FACTOR_COLUMNS if correlated else STANDALONE_FACTOR_COLUMNS
+    mean = calibration.mean.loc[list(factors)].to_numpy()
+    std = calibration.std.loc[list(factors)].to_numpy()
+    rng = create_rng(purpose, master_seed)
+    daily = np.empty((path_count, TRADING_DAYS, len(factors)), dtype=float)
+    # Generate one day at a time to avoid a second full 10,000 x 252 x 8 array.
+    for day in range(TRADING_DAYS):
+        innovations = rng.standard_normal((path_count, len(factors)))
+        if correlated:
+            daily[:, day, :] = innovations @ calibration.covariance_adjustment.factor.T + mean
+        else:
+            daily[:, day, :] = innovations * std + mean
+    if not np.isfinite(daily).all():
+        raise DataValidationError("Simulated daily changes are not finite")
+    path_index = pd.RangeIndex(1, path_count + 1, name="path")
+    daily_index = pd.MultiIndex.from_product(
+        [path_index, range(1, TRADING_DAYS + 1)], names=["path", "day"]
+    )
+    daily_changes = pd.DataFrame(daily.reshape(-1, len(factors)), index=daily_index, columns=factors)
+    cumulative = pd.DataFrame(daily.sum(axis=1), index=path_index, columns=factors)
+    yield_factors = [factor for factor in factors if factor in YIELD_COLUMNS]
+    terminal_yields = cumulative.loc[:, yield_factors].add(row.loc[yield_factors], axis=1)
+    bond_prices = zero_coupon_price(
+        terminal_yields.loc[:, list(TERMINAL_YIELD_COLUMNS)].to_numpy(),
+        np.asarray(TERMINAL_MATURITIES),
+    )
+    # Initial Adj Close anchors simulated adjusted prices. Converting back to a
+    # value per initial observed share retains the original Close-based quantity.
+    try:
+        with np.errstate(over="raise", under="raise", invalid="raise", divide="raise"):
+            adjusted_prices = np.exp(cumulative.loc[:, list(ETF_TICKERS)]).mul(
+                allocation.initial_etf_adj_close, axis=1
+            )
+            etf_unit_prices = adjusted_prices.div(allocation.initial_etf_adj_close, axis=1).mul(
+                allocation.initial_etf_close, axis=1
+            )
+            unit_prices = pd.DataFrame(
+                np.column_stack([bond_prices, etf_unit_prices.to_numpy()]),
+                index=path_index, columns=HOLDINGS,
+            )
+            quantities = pd.concat([
+                allocation.treasury_face_quantities, allocation.etf_shares
+            ]).reindex(HOLDINGS).rename("fixed_quantity")
+            values = unit_prices.mul(quantities, axis=1)
+            returns = values.div(allocation.initial_holding_values, axis=1) - 1.0
+    except FloatingPointError as exc:
+        raise DataValidationError("Terminal values are not representable; paths were not clipped") from exc
+    initial_prices = pd.concat([
+        treasury_unit_prices(levels, stamp), allocation.initial_etf_close
+    ]).reindex(HOLDINGS).rename("initial_unit_price")
+    columns, initial = {}, {}
+    for holding in HOLDINGS:
+        for metric, series, initial_value in (
+            ("unit_price", unit_prices[holding], initial_prices[holding]),
+            ("value", values[holding], allocation.initial_holding_values[holding]),
+            ("return", returns[holding], 0.0),
+        ):
+            columns[holding, metric] = series
+            initial[holding, metric] = initial_value
+        if holding in ETF_TICKERS:
+            columns[holding, "adjusted_price"] = adjusted_prices[holding]
+            initial[holding, "adjusted_price"] = allocation.initial_etf_adj_close[holding]
+    columns["Portfolio", "value"] = values.sum(axis=1)
+    columns["Portfolio", "return"] = columns["Portfolio", "value"] / allocation.initial_value - 1.0
+    initial["Portfolio", "value"], initial["Portfolio", "return"] = allocation.initial_value, 0.0
+    paths = pd.DataFrame(columns, index=path_index)
+    paths.columns = pd.MultiIndex.from_tuples(paths.columns, names=["holding", "metric"])
+    if not np.isfinite(paths.to_numpy()).all() or (unit_prices.to_numpy() <= 0).any():
+        raise DataValidationError("Terminal prices, values, or returns are invalid")
+    summary = paths.describe(percentiles=list(SUMMARY_PERCENTILES)).T
+    summary.insert(0, "initial", pd.Series(initial))
+    return TerminalSimulation(
+        purpose, create_child_seeds(master_seed)[purpose], TRADING_DAYS, allocation,
+        quantities, initial_prices, pd.Series(TERMINAL_MATURITIES, index=TREASURY_HOLDINGS,
+                                             name="remaining_years"),
+        daily_changes, terminal_yields, paths, summary,
+    )
+
+
+def simulate_standalone_terminal(
+    calibration: GaussianCalibration,
+    allocation: PortfolioAllocation,
+    levels: pd.DataFrame,
+    *,
+    path_count: int = SIMULATION_PATHS,
+    master_seed: int = MASTER_SEED,
+) -> TerminalSimulation:
+    """Simulate five independent marginals for 252 days, then fully reprice.
+
+    Treasury shocks use the 1-, 4-, and 9-year yield marginals and their initial
+    curve levels, while returns retain the initial 2-, 5-, and 10-year prices.
+    Standalone Portfolio totals are the sum of these independent draws.
+    """
+    return _simulate_terminal(
+        calibration, allocation, levels, "standalone_terminal_simulation", path_count, master_seed
+    )
+
+
+def simulate_correlated_terminal(
+    calibration: GaussianCalibration,
+    allocation: PortfolioAllocation,
+    levels: pd.DataFrame,
+    *,
+    path_count: int = SIMULATION_PATHS,
+    master_seed: int = MASTER_SEED,
+) -> TerminalSimulation:
+    """Simulate all six yield factors and both ETF log returns jointly for 252 days."""
+    return _simulate_terminal(
+        calibration, allocation, levels, "correlated_terminal_simulation", path_count, master_seed
+    )
+
+
+def run_terminal_analysis(
+    market: MarketData,
+    allocation_date: object | None = None,
+    *,
+    path_count: int = SIMULATION_PATHS,
+    master_seed: int = MASTER_SEED,
+) -> TerminalAnalysis:
+    """Calibrate and run both terminal analyses in memory at one common date.
+
+    Default: latest 500 changes available through 2026-08-31, allocated at the
+    last common valid observation. Explicit allocation dates use only changes
+    through that date and must themselves be common valid observations.
+    """
+    cutoff = ANALYSIS_END if allocation_date is None else allocation_date
+    calibration = calibrate_gaussian(market.risk_factor_changes, cutoff)
+    stamp = calibration.sample.index[-1] if allocation_date is None else allocation_date
+    allocation = allocate_portfolio(market.levels, stamp)
+    standalone = simulate_standalone_terminal(
+        calibration, allocation, market.levels, path_count=path_count, master_seed=master_seed
+    )
+    correlated = simulate_correlated_terminal(
+        calibration, allocation, market.levels, path_count=path_count, master_seed=master_seed
+    )
+    return TerminalAnalysis(calibration, standalone, correlated)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the in-memory data/pricing foundation; no simulations or files are produced."""
+    """Report the foundation and optionally terminal simulations without output files."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--allocation-date", help="Exact common date; default: first valid date")
+    parser.add_argument("--allocation-date", help="Exact common date; default: first valid, or latest for --terminal")
     parser.add_argument("--valuation-date", help="Exact common date; default: allocation date")
+    parser.add_argument("--terminal", action="store_true", help="Also run both 10,000-path, 252-day terminal analyses")
     args = parser.parse_args(argv)
     try:
         market = retrieve_market_data()
-        allocation_date = args.allocation_date or market.levels.index[0]
-        allocation = allocate_portfolio(market.levels, allocation_date)
+        analysis = run_terminal_analysis(market, args.allocation_date) if args.terminal else None
+        if analysis is None:
+            allocation_date = args.allocation_date or market.levels.index[0]
+            allocation = allocate_portfolio(market.levels, allocation_date)
+        else:
+            allocation = analysis.correlated.allocation
         valuation_date = args.valuation_date or allocation.allocation_date
         values = holding_values(allocation, market.levels, valuation_date)
     except (DataValidationError, DataRetrievalError) as exc:
@@ -559,6 +876,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Portfolio value: USD {values.sum():,.2f}")
     print("Latest aligned yield changes (basis points):")
     print(market.yield_changes_bp.tail(1).to_string())
+    if analysis is not None:
+        calibration = analysis.calibration
+        correction = calibration.covariance_adjustment
+        print(
+            f"Gaussian calibration: {len(calibration.sample)} aligned changes, "
+            f"{calibration.sample.index[0].date()} through {calibration.sample.index[-1].date()}; "
+            f"sample std/covariance ddof={ESTIMATION_DDOF}."
+        )
+        print(
+            f"Covariance correction: {correction.clipped_eigenvalues} negative eigenvalues clipped; "
+            f"original minimum={correction.original_min_eigenvalue:.6g}; "
+            f"tolerance={correction.tolerance:.6g}; "
+            f"Frobenius correction={correction.correction_frobenius_norm:.6g}."
+        )
+        for result in (analysis.standalone, analysis.correlated):
+            print(
+                f"{result.purpose}: {len(result.paths)} paths, {result.horizon_days} trading days; "
+                f"seed={result.seed}; Treasury maturities={TERMINAL_MATURITIES}."
+            )
+            print("Summary: unit prices, adjusted ETF prices, USD values, decimal simple returns.")
+            print(result.summary.to_string())
     return 0
 
 
