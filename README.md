@@ -27,17 +27,15 @@ At least 751 aligned levels, hence **750 aligned changes**, are required for the
 
 ## Valuation and allocations
 
-Source yields are percentages; dividing by 100 gives decimal yields. Daily yield changes remain in decimal-yield units internally; multiplying by 10,000 reports basis points. ETF changes are natural logarithms of consecutive aligned **Adj Close** ratios, never `Close` returns.
+Source yields are divided by 100 to convert percentages to decimal yields. Daily yield changes use decimal units; multiply by 10,000 for basis points. ETF changes are log returns calculated only from **Adj Close** ratios.
 
-For remaining maturity `T` years and decimal continuous yield `y(T)`, a Treasury costs `exp(-y(T) * T)` USD per USD 1 face. Yields are linearly interpolated between the bracketing fitted tenors, including the 1-2, 4-5, and 9-10 year intervals. There is no extrapolation outside 1-10 years. Initial face quantities equal allocated dollars divided by the allocation-date price at the original 2-, 5-, or 10-year maturity.
+A Treasury with remaining maturity `T` and decimal yield `y(T)` costs `exp(-y(T) * T)` USD per USD 1 face. Yields are linearly interpolated between bracketing fitted tenors, including 1-2, 4-5, and 9-10 years, with no extrapolation outside 1-10 years. Initial face quantities equal allocated dollars divided by the price at the original 2-, 5-, or 10-year maturity.
 
-The terminal analysis allocates at the latest common valid date on or before 2026-08-31 and calibrates on the latest 500 changes ending there. The backtest makes a separate allocation at the origin immediately preceding its first selected forecast. These dates and fixed quantities appear in `data_quality.csv`; terminal and VaR tables also carry allocation dates. Quantities stay fixed within each analysis, with no interim rebalancing; market weights drift.
+The terminal analysis allocates at the latest common valid date on or before 2026-08-31 and uses the latest 500 changes ending there. The backtest allocates separately at its first forecast origin. For the saved results, these dates are **2026-08-31** and **2025-08-28**, respectively; forecasts run from **2025-08-29 through 2026-08-31**. Allocation dates and quantities are recorded in [data_quality.csv](outputs/data_quality.csv). Each analysis holds quantities fixed without rebalancing, so market weights drift.
 
-For the completed sample, the terminal allocation date is **2026-08-31**, the backtest allocation date is **2025-08-28**, and the 250 forecast dates run from **2025-08-29 through 2026-08-31**. The recorded output dates remain authoritative if source availability changes.
+Initial ETF shares equal allocated dollars divided by allocation-date `Close`. Later holding values equal the initial allocation times `Adj Close(t) / Adj Close(allocation)`, including reinvested distributions and split adjustments. Simulated terminal `Adj Close` equals its allocation-date value times the exponential of cumulative log returns. Terminal `unit_price` equals initial `Close` times the adjusted-price ratio: a total-return-equivalent value per initial share.
 
-An ETF's initial shares equal its allocated dollars divided by allocation-date `Close`. Every later holding value equals its initial allocation times `Adj Close(t) / Adj Close(allocation)`, representing reinvested distributions and split adjustments. Terminal adjusted prices equal allocation-date `Adj Close` times the exponential of cumulative simulated log returns. The separate terminal `unit_price` is the total-return-equivalent value per initial share: initial `Close` times that same adjusted-price ratio. It need not equal an observed future raw closing price.
-
-The terminal horizon ages each Treasury exactly one year, leaving maturities **1, 4, and 9 years**. Backtest aging uses elapsed aligned forecast steps divided by 252, consistently for origin, scenario, and realized valuations. Thus its final maturities are initial maturity minus 250/252 years, even when the calendar span exceeds a year. This explicit trading-time convention keeps the short bond inside the available fitted-tenor range. The reusable historical valuation helper defaults to actual calendar days/365; the complete backtest supplies its trading-time age explicitly. Every scenario uses full exponential Treasury repricing and ETF adjusted-price scaling, with no duration approximation.
+After 252 trading days, Treasury maturities are **1, 4, and 9 years**. Backtest aging uses elapsed aligned steps/252 for both scenario and realized valuations, leaving initial maturity minus 250/252 years at its end. This convention keeps the short bond within the fitted-tenor range even if the calendar span exceeds a year. The general valuation helper defaults to calendar days/365; the backtest supplies its trading-time age explicitly. All scenarios fully reprice holdings without a duration approximation.
 
 ## Fixed settings and randomness
 
@@ -78,17 +76,43 @@ Covariance handling only clips negative eigenvalues attributable to numerical ro
 
 ## VaR, coverage, diversification, and attribution
 
-For each forecast, exactly the immediately preceding 500 aligned changes are available at its origin. Explicit index checks require that the estimation window ends at the origin and before the realized P&L date. Parametric VaR fits all eight Gaussian means and covariances and generates 10,000 one-day full-revaluation scenarios. Historical VaR applies each of those 500 observed eight-factor changes to current levels and fully reprices the same fixed holdings at the next step's maturity.
+Each forecast uses exactly the preceding 500 aligned changes. Index checks ensure that the window ends at the forecast origin and excludes the realized forecast-day change. Parametric VaR fits the eight-factor Gaussian model and draws 10,000 one-day scenarios. Historical VaR replays the same window's 500 observed changes. Both methods apply changes to current levels and fully reprice fixed holdings at the next step's maturity.
 
-Loss is current holding value minus scenario value. VaR is the signed 99th percentile of that USD loss, without flooring at zero; sufficiently consistent gains can yield negative loss VaR. Realized P&L is actual next-day value minus current value on the same valuation basis. An exception is strictly `realized_pnl < -forecast_var`. Each method reports all five allocated holdings and the total portfolio: 250 forecasts each, or 3,000 forecast rows overall. Figures plot realized P&L against **negative VaR** thresholds.
+VaR is the 99th percentile of USD loss: current value minus scenario value. It is not floored at zero, so consistent modeled gains can produce negative VaR. Realized P&L is actual next-day value minus current value; an exception occurs when `realized_pnl < -forecast_var`. Each method produces 250 forecasts for all five holdings and the portfolio, giving 3,000 rows. Backtest plots compare P&L with **negative VaR** thresholds.
 
-Kupiec unconditional coverage compares the observed exception rate with 1%, using a likelihood-ratio statistic and a one-degree-of-freedom chi-squared p-value. Christoffersen independence uses consecutive exception transitions (249 transitions for 250 forecasts); conditional coverage adds the Kupiec and independence statistics and uses two degrees of freedom. Stable log-likelihood calculations implement `0 * log(0) = 0`, including zero or all exceptions, without pseudocounts. If a conditioning state is never observed, its transition probability is not identified and is written as `not_identified`, with an explicit status column. The independence likelihood-ratio contribution is zero for a constant sequence. Likelihood statistics and p-values remain finite for the full backtest; an unidentified probability is not fabricated.
+Kupiec tests whether the exception rate matches 1%, using a likelihood-ratio statistic with a one-degree-of-freedom chi-squared p-value. Christoffersen independence tests whether exceptions cluster, using the 249 transitions between 250 forecasts and one degree of freedom. Conditional coverage combines the Kupiec and independence statistics and uses two degrees of freedom. Zero counts use `0 * log(0) = 0`, without pseudocounts. An unobserved conditioning state's probability is reported as `not_identified`; constant sequences have an independence statistic of zero.
 
-At the latest forecast, each method's diversification effect equals the sum of the five allocated standalone holding VaRs minus portfolio VaR. These holding VaRs already include their allocated positions: weights are not applied a second time.
+At the latest forecast, diversification equals the sum of the five allocated holding VaRs minus portfolio VaR. Holding VaRs already reflect position sizes, so weights are not applied again.
 
-Latest parametric Euler contributions use the **same** full-revaluation scenario losses for all five holdings. For each position, a central proportional finite difference approximates the derivative of portfolio VaR, multiplied by position size. Both perturbed portfolios retain the common scenarios and fixed quantities for other positions. The result reports five contributions, their sum, portfolio VaR, and the residual `portfolio_VaR - contribution_sum`. Contributions are not normalized to force reconciliation. Empirical quantile changes and finite differences can produce a residual or negative contributions.
+Euler attribution uses the latest parametric loss scenarios for all five holdings. Each position is bumped by +/-0.01%, with other positions fixed; central finite differences estimate the VaR derivative, multiplied by position size. The five contributions, their sum, portfolio VaR, and residual `portfolio_VaR - contribution_sum` are reported without rescaling. Quantile changes can produce a residual or negative contributions.
 
-Low coverage-test p-values suggest incompatibility with the specified coverage or independence hypothesis. Large p-values do not establish correctness, and the analysis does not require a particular statistical-test outcome to succeed. Terminal percentiles describe simulated distributions; they are not confidence intervals for estimated parameters.
+Low test p-values suggest a coverage or independence mismatch. Large p-values do not establish model correctness, and no particular test outcome is required for the analysis to succeed.
+
+## Simulation and backtest results
+
+These saved results use the **2022-09-01 through 2026-08-31** sample and the documented seeds. Terminal simulations allocate on **2026-08-31**, calibrate on 500 changes from **2024-08-27 through 2026-08-31**, and generate **10,000 paths over 252 trading days**. Returns below are percentages; the underlying CSV stores decimal returns.
+
+| Terminal distribution | Mean return | 1st percentile | Median | 99th percentile |
+| --- | ---: | ---: | ---: | ---: |
+| Standalone 2-year Treasury | 4.51% | 3.17% | 4.51% | 5.92% |
+| Standalone 5-year Treasury | 3.33% | -4.30% | 3.29% | 11.45% |
+| Standalone 10-year Treasury | 1.16% | -14.41% | 0.95% | 19.28% |
+| Standalone LQD | 2.04% | -12.41% | 1.84% | 18.21% |
+| Standalone SPY | 19.83% | -20.01% | 18.13% | 74.52% |
+| Correlated portfolio | 9.55% | -8.89% | 8.95% | 33.25% |
+
+The correlated portfolio's mean terminal value is **USD 1,095,458** from the USD 1,000,000 initial notional; its 1st percentile is **USD 911,129**. These are conditional simulated outcomes, not confidence intervals for estimated parameters. Full price, value, and return statistics are in [terminal_summary.csv](outputs/terminal_summary.csv).
+
+The **99% one-day** portfolio backtest covers **250 forecasts from 2025-08-29 through 2026-08-31**, each using a 500-change rolling window. VaR below is for the latest forecast, **2026-08-31**; exception counts and test p-values cover the full backtest.
+
+| Method | Latest portfolio VaR (USD) | Exceptions / 250 | Exception rate | Kupiec p-value | Christoffersen conditional-coverage p-value |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Parametric | 12,930.35 | 3 | 1.2% | 0.758 | 0.919 |
+| Historical | 15,302.50 | 1 | 0.4% | 0.278 | 0.553 |
+
+Only 2.5 exceptions are expected over 250 forecasts at 99% confidence, so these tests have limited tail evidence. Individual holdings can show different coverage: the historical 5-year Treasury had no exceptions and a Kupiec p-value of 0.025. See [var_summary.csv](outputs/var_summary.csv) for all holding and portfolio results.
+
+At the latest forecast, diversification effects are **USD 2,670.14** for parametric VaR and **USD 2,552.84** for historical VaR. SPY has the largest parametric Euler contribution, **USD 11,399.24**; the 2-year Treasury has a small negative contribution of **USD -6.37**. The five contributions sum to **USD 12,930.35**, with a disclosed residual of approximately **USD -3.29e-08**. Full reconciliation is in [risk_summary.csv](outputs/risk_summary.csv). These sample results do not guarantee future returns or risk coverage.
 
 ## Run locally
 
@@ -104,19 +128,21 @@ python -m venv .venv
 
 Environment creation and installation are setup steps; reuse the existing environment for subsequent tests and analyses. The single analysis command performs retrieval, validation, alignment, simulation, rolling forecasts, coverage tests, diversification, attribution, and reporting with the fixed settings. It renders figures in memory, closes them after rendering, and creates `outputs/` only after successful analysis and report preparation. Subsequent successful runs replace the same nine result files. No additional output files are produced.
 
-## Generated results
+## Repository and outputs
 
-| File in `outputs/` | Contents |
+| Location | Contents |
 | --- | --- |
-| `data_quality.csv` | Tidy source coverage, raw missing-cell and duplicate checks, row counts, dropped dates, alignment counts, units, maturity and aging conventions, source-period deviations, fixed allocations, seeds, and numerical covariance diagnostics. |
-| `terminal_paths.csv` | Exactly 10,000 path rows. Prefixed columns distinguish five standalone holding distributions from correlated holding and portfolio results. Includes terminal prices or per-unit values, adjusted ETF prices, allocated holding values and decimal returns, correlated portfolio value and return, seeds, and calibration/horizon metadata. |
-| `terminal_summary.csv` | Initial levels, observation counts, means, sample standard deviations, minima, 1st/50th/99th percentiles, and maxima for all 36 published terminal holding/portfolio metrics, with explicit units and analysis context. |
-| `var_forecasts.csv` | All 3,000 method/holding forecasts, USD VaR and realized P&L, exception indicators, estimation dates, origins, forecast dates and ordinals, scenario counts, and forecast seeds. |
-| `var_summary.csv` | Twelve method/holding rows: forecast and exception counts/rates, Kupiec and Christoffersen statistics and p-values, transition counts/probabilities and identification status, sample and forecast context. |
-| `risk_summary.csv` | Latest-forecast holding VaRs, their sum, portfolio VaR, and diversification for both methods; five parametric Euler contributions, their total, explicit residual, and position-bump setting. All risk amounts are USD. |
-| `terminal_distributions.png` | Six labelled return-distribution panels: standalone and correlated holding marginals, plus the correlated portfolio, with source, calibration, path, and horizon labels. |
-| `var_backtests.png` | Six labelled realized-P&L panels with parametric and historical negative-VaR thresholds and exception markers, dates, window/scenario counts, and valuation context. |
-| `risk_contributions.png` | Five holding-level parametric Euler contributions, alongside portfolio VaR, contribution sum, and the unscaled reconciliation residual. |
+| [portfolio_var.py](portfolio_var.py) | All configuration and functions for retrieval, validation, pricing, simulation, VaR backtesting, coverage tests, diversification, attribution, and output generation. Run this module to perform the complete analysis. |
+| [test_portfolio_var.py](test_portfolio_var.py) | Consolidated offline `unittest` suite using synthetic data. |
+| [outputs/data_quality.csv](outputs/data_quality.csv) | Source coverage, missing and dropped dates, alignment, units, conventions, allocations, seeds, and covariance corrections. |
+| [outputs/terminal_paths.csv](outputs/terminal_paths.csv) | 10,000 path rows containing standalone holding distributions and correlated holding and portfolio results. |
+| [outputs/terminal_summary.csv](outputs/terminal_summary.csv) | Initial levels, units, and distribution statistics for all 36 terminal metrics. |
+| [outputs/var_forecasts.csv](outputs/var_forecasts.csv) | 3,000 forecasts with VaR, realized P&L, exceptions, estimation-window dates, scenario counts, and seeds. |
+| [outputs/var_summary.csv](outputs/var_summary.csv) | Forecast and exception counts and rates, plus Kupiec and Christoffersen coverage tests. |
+| [outputs/risk_summary.csv](outputs/risk_summary.csv) | Latest holding and portfolio VaRs, diversification effects, five Euler contributions, their sum, and the attribution residual. |
+| [outputs/terminal_distributions.png](outputs/terminal_distributions.png) | Six panels comparing standalone and correlated terminal-return distributions. |
+| [outputs/var_backtests.png](outputs/var_backtests.png) | Six panels showing realized P&L, negative-VaR thresholds, and exceptions for both methods. |
+| [outputs/risk_contributions.png](outputs/risk_contributions.png) | Five holding-level contributions and their reconciliation to portfolio VaR. |
 
 CSV return columns are **decimal** returns; terminal return plots use **percentages**. Dollar prices, values, P&L, and VaR have labelled USD units; Treasury unit prices are per USD 1 face. Tables carry requested and actual sample periods, reporting notional, confidence level, and the relevant allocation, calibration/rolling window, forecast count, scenario/path count, and horizon. Historical replay scenarios are observations, not random simulation paths.
 
