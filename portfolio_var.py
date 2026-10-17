@@ -36,17 +36,18 @@ Latest-forecast Euler attribution uses common full-revaluation scenarios and
 central proportional position bumps, reporting the unnormalized residual.
 
 Importing does not retrieve data, seed global random state, or write analysis files.
-Executing reports the foundation; --terminal also simulates terminal distributions.
-All paths, summaries, and numerical covariance corrections remain in memory.
+Executing runs the complete analysis and writes the nine configured result files
+only after analysis, table validation, and in-memory figure rendering succeed.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 from dataclasses import dataclass
 from datetime import date, datetime
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -107,6 +108,14 @@ YFINANCE_CACHE_DIRECTORY = Path(__file__).resolve().parent / ".venv" / "yfinance
 LEVEL_COLUMNS = YIELD_COLUMNS + tuple(
     f"{ticker}_{field}" for ticker in ETF_TICKERS for field in ETF_PRICE_FIELDS
 )
+PROJECT_DIRECTORY = Path(__file__).resolve().parent
+OUTPUT_DIRECTORY = PROJECT_DIRECTORY / "outputs"
+CSV_FILENAMES = ("data_quality.csv", "terminal_paths.csv", "terminal_summary.csv",
+                 "var_forecasts.csv", "var_summary.csv", "risk_summary.csv")
+FIGURE_FILENAMES = ("terminal_distributions.png", "var_backtests.png", "risk_contributions.png")
+OUTPUT_FILENAMES = CSV_FILENAMES + FIGURE_FILENAMES
+FIGURE_DPI = 150
+PLOT_HOLDING_LABELS = ("2-year Treasury", "5-year Treasury", "10-year Treasury", "LQD", "SPY", "Portfolio")
 
 
 class DataValidationError(ValueError):
@@ -162,6 +171,7 @@ class SourceCoverage:
     incomplete_dates: tuple[pd.Timestamp, ...]
     absent_weekdays: tuple[pd.Timestamp, ...]
     boundary_shortfalls: tuple[str, ...]
+    missing_value_count: int
 
 
 @dataclass(frozen=True)
@@ -299,6 +309,15 @@ class BacktestResult:
     attribution: VaRAttribution
 
 
+@dataclass(frozen=True)
+class CompleteAnalysis:
+    """One source snapshot shared by every terminal, backtest, and reporting result."""
+
+    market: MarketData
+    terminal: TerminalAnalysis
+    backtest: BacktestResult
+
+
 def _as_date(value: object, label: str) -> pd.Timestamp:
     """Parse ISO dates or datetime objects, preserving their local session date."""
     if isinstance(value, str):
@@ -400,7 +419,7 @@ def validate_source_frame(
     coverage = SourceCoverage(
         source, first, last, valid.index[0], valid.index[-1], len(data),
         tuple(data.index[incomplete]), tuple(weekdays.difference(data.index)),
-        tuple(shortfalls),
+        tuple(shortfalls), int(data.isna().sum().sum()),
     )
     return data, coverage
 
@@ -1216,77 +1235,357 @@ def backtest_var(
                           diversification, attribution)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Report the foundation and optionally terminal simulations without output files."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--allocation-date", help="Exact common date; default: first valid, or latest for --terminal")
-    parser.add_argument("--valuation-date", help="Exact common date; default: allocation date")
-    parser.add_argument("--terminal", action="store_true", help="Also run both 10,000-path, 252-day terminal analyses")
-    args = parser.parse_args(argv)
+def run_full_analysis() -> CompleteAnalysis:
+    """Complete the fixed analysis from one live snapshot before creating outputs/."""
+    market = retrieve_market_data()
+    _backtest_inputs(market)
+    required = CALIBRATION_WINDOW + BACKTEST_FORECASTS
+    if len(market.risk_factor_changes) < required:
+        raise DataValidationError(
+            f"At least {required} aligned changes are required; live sources supplied "
+            f"{len(market.risk_factor_changes)}. No result files were generated."
+        )
+    terminal = run_terminal_analysis(market)
+    backtest = backtest_var(market)
+    return CompleteAnalysis(market, terminal, backtest)
+
+
+def _report_metadata(result: CompleteAnalysis) -> dict[str, object]:
+    return {
+        "requested_start": ANALYSIS_START, "requested_end": ANALYSIS_END,
+        "sample_start": result.market.levels.index[0].strftime("%Y-%m-%d"),
+        "sample_end": result.market.levels.index[-1].strftime("%Y-%m-%d"),
+        "confidence_level": VAR_CONFIDENCE, "reporting_notional_usd": INITIAL_PORTFOLIO_VALUE,
+        "master_seed": MASTER_SEED,
+    }
+
+
+def _with_metadata(frame: pd.DataFrame, metadata: Mapping[str, object]) -> pd.DataFrame:
+    result = frame.copy()
+    for key, value in metadata.items():
+        result[key] = value
+    return result
+
+
+def data_quality_table(result: CompleteAnalysis) -> pd.DataFrame:
+    """Tidy diagnostics, units, conventions, source deviations, positions, and seeds."""
+    rows = []
+
+    def add(section, subject, check, value, unit="text", details="none"):
+        rows.append({"section": section, "subject": subject, "check": check,
+                     "value": str(value), "unit": unit, "details": str(details)})
+
+    def dates(values):
+        return ";".join(stamp.strftime("%Y-%m-%d") for stamp in values) or "none"
+
+    for source in result.market.coverage:
+        add("source", source.source, "first_valid_date", source.first_valid_date.date(), "date")
+        add("source", source.source, "last_valid_date", source.last_valid_date.date(), "date")
+        add("source", source.source, "in_period_rows", source.observation_count, "rows")
+        add("source", source.source, "complete_rows", source.observation_count - len(source.incomplete_dates), "rows")
+        add("source", source.source, "alignment_dropped_rows", source.observation_count - len(result.market.levels), "rows")
+        add("source", source.source, "duplicate_dates", 0, "count", "Duplicates are rejected before alignment")
+        add("source", source.source, "missing_values", source.missing_value_count, "cells")
+        add("source", source.source, "incomplete_rows", len(source.incomplete_dates), "rows", dates(source.incomplete_dates))
+        add("source", source.source, "absent_weekdays", len(source.absent_weekdays), "days",
+            dates(source.absent_weekdays) + "; absent weekdays can be legitimate holidays")
+        add("source", source.source, "source_period_deviation", ";".join(source.boundary_shortfalls) or "none",
+            details="Boundary shortfalls compare complete observations with requested weekdays; no dates are fabricated")
+    market = result.market
+    for check, value, unit in (
+        ("aligned_levels", len(market.levels), "rows"),
+        ("aligned_changes", len(market.risk_factor_changes), "changes"),
+        ("required_backtest_changes", CALIBRATION_WINDOW + BACKTEST_FORECASTS, "changes"),
+        ("duplicate_dates", int(market.levels.index.duplicated().sum()), "count"),
+        ("missing_required_values", int(market.levels.isna().sum().sum()), "cells"),
+        ("nonfinite_changes", int((~np.isfinite(market.risk_factor_changes.to_numpy())).sum()), "cells"),
+        ("dropped_dates", len(market.dropped_dates), "days"),
+        ("maximum_calendar_gap", int((market.levels.index[1:] - market.levels.index[:-1]).days.max()), "days"),
+    ):
+        add("alignment", "all eight factors", check, value, unit,
+            dates(market.dropped_dates) if check == "dropped_dates" else "none")
+    add("alignment", "all eight factors", "policy", "Common valid dates before differences; no filling")
+    add("alignment", "all eight factors", "required_level_columns", ";".join(market.levels.columns))
+    add("alignment", "all eight factors", "ordered_change_factors", ";".join(market.risk_factor_changes.columns))
+    add("alignment", "all eight factors", "date_spans", "Changes span consecutive retained dates, including source-calendar gaps")
+    add("validation", "all sources", "checks", "PASS",
+        details="ISO dates, required columns, unique dates/columns, real numeric types, finite values, positive ETF prices, source coverage")
+    for subject, convention in (
+        ("Treasury yields", "Source percentage yields / 100 = decimal yields"),
+        ("Treasury changes", "Decimal-yield units internally; multiply by 10000 for basis points"),
+        ("ETF changes", "Natural log of consecutive aligned Adj Close ratios; decimal log return"),
+        ("Treasury pricing", "exp(-decimal yield * remaining years), USD per USD 1 face"),
+        ("Maturity interpolation", "Linear yield interpolation between bracketing fitted tenors, including 1-2, 4-5, 9-10; no extrapolation"),
+        ("Terminal aging", "252 trading days = 1 year; remaining maturities 1, 4, 9 years"),
+        ("Backtest aging", "Aligned forecast steps / 252 from first forecast origin, in scenarios AND realized valuations"),
+        ("Historical helper default", "ACT/365 Fixed; complete backtest explicitly supplies the aligned-step clock"),
+        ("ETF valuation", "Initial allocation / Close gives shares; all later values use initial allocation * Adj Close ratio"),
+        ("Returns and risk", "CSV returns are decimal; dollar loss VaR and P&L are USD; charts explicitly label percentages"),
+    ):
+        add("convention", subject, "units_and_method", convention)
+    for purpose, seed in CHILD_SEEDS.items():
+        add("randomness", purpose, "child_seed", seed, "integer seed")
+    add("randomness", "rolling VaR", "forecast_seed_rule",
+        "SeedSequence(rolling child seed, spawn_key=(global eligible forecast ordinal,)); uint64 state",
+        details="Each parametric forecast seed is recorded in var_forecasts.csv")
+    add("randomness", "attribution", "draws", "No new draws: reuse latest parametric full-revaluation losses")
+    for analysis, allocation in (("terminal", result.terminal.correlated.allocation),
+                                 ("backtest", result.backtest.allocation)):
+        add("allocation", analysis, "allocation_date", allocation.allocation_date.date(), "date")
+        quantities = pd.concat([allocation.treasury_face_quantities, allocation.etf_shares]).reindex(HOLDINGS)
+        for holding, weight in zip(HOLDINGS, WEIGHTS):
+            add("allocation", analysis + ":" + holding, "initial_weight", weight, "decimal")
+            add("allocation", analysis + ":" + holding, "fixed_quantity", quantities[holding],
+                "USD face" if holding in TREASURY_HOLDINGS else "initial shares")
+    correction = result.terminal.calibration.covariance_adjustment
+    add("numerics", "terminal covariance", "clipped_eigenvalues", correction.clipped_eigenvalues, "count")
+    add("numerics", "terminal covariance", "correction_frobenius_norm", correction.correction_frobenius_norm, "native covariance units")
+    add("numerics", "rolling covariance", "clipped_eigenvalues_total",
+        result.backtest.windows["covariance_clipped_eigenvalues"].sum(), "count")
+    add("numerics", "rolling covariance", "maximum_correction_frobenius_norm",
+        result.backtest.windows["covariance_correction_frobenius_norm"].max(), "native covariance units")
+    add("numerics", "covariance", "policy", "Reject material indefiniteness; clip only negative eigenvalues within 10*n*eps*eigenvalue scale to zero; no jitter")
+    return _with_metadata(pd.DataFrame(rows), _report_metadata(result))
+
+
+def build_output_tables(result: CompleteAnalysis) -> dict[str, pd.DataFrame]:
+    """Build six finite, explicitly labelled tables; never touch the filesystem."""
+    metadata = _report_metadata(result)
+    terminal = result.terminal
+    backtest = result.backtest
+    terminal_context = {**metadata, "allocation_date": terminal.correlated.allocation.allocation_date,
+                        "calibration_start": terminal.calibration.sample.index[0],
+                        "calibration_end": terminal.calibration.sample.index[-1],
+                        "calibration_changes": len(terminal.calibration.sample),
+                        "horizon_trading_days": TRADING_DAYS, "path_count": len(terminal.correlated.paths)}
+    paths = pd.DataFrame({"path": terminal.correlated.paths.index})
+    summaries = []
+    for method, simulation in (("standalone", terminal.standalone), ("correlated", terminal.correlated)):
+        selected = simulation.paths.loc[:, [column for column in simulation.paths.columns
+                                             if method == "correlated" or column[0] != "Portfolio"]]
+        for holding, metric in selected.columns:
+            suffix = {"value": "value_usd", "return": "return_decimal", "adjusted_price": "adjusted_price_usd"}.get(metric)
+            if metric == "unit_price":
+                suffix = "unit_price_usd_per_face" if holding in TREASURY_HOLDINGS else "unit_price_usd_per_initial_share"
+            paths[f"{method}_{holding}_{suffix}"] = selected[holding, metric].to_numpy()
+        summary = simulation.summary.loc[selected.columns].reset_index()
+        summary.insert(0, "analysis", method)
+        summary["unit"] = [
+            "decimal return" if metric == "return" else
+            "USD per USD 1 face" if metric == "unit_price" and holding in TREASURY_HOLDINGS else
+            "USD per initial ETF share" if metric == "unit_price" else
+            "USD adjusted-price basis" if metric == "adjusted_price" else "USD"
+            for holding, metric in zip(summary["holding"], summary["metric"])
+        ]
+        summary["count"] = summary["count"].astype(int)
+        summary["seed"] = str(simulation.seed)
+        summaries.append(summary.rename(columns={"1%": "p01", "50%": "p50", "99%": "p99"}))
+    paths["standalone_seed"] = str(terminal.standalone.seed)
+    paths["correlated_seed"] = str(terminal.correlated.seed)
+    paths = _with_metadata(paths, terminal_context)
+    terminal_summary = _with_metadata(pd.concat(summaries, ignore_index=True), terminal_context)
+    forecast_count = len(backtest.windows)
+    backtest_context = {**metadata, "allocation_date": backtest.allocation.allocation_date,
+                        "rolling_window_changes": CALIBRATION_WINDOW, "forecast_count": forecast_count,
+                        "horizon_trading_days": 1, "aging_clock": "aligned steps / 252", "monetary_unit": "USD"}
+    forecasts = _with_metadata(backtest.records, backtest_context)
+    forecasts["scenario_count"] = forecasts["method"].map(
+        {method: len(backtest.latest_scenarios[method]) for method in VAR_METHODS})
+    forecast_seeds = backtest.windows["parametric_seed"].map(str)
+    forecasts["forecast_seed"] = [forecast_seeds.loc[date] if method == "parametric" else "not_used"
+                                   for method, date in zip(forecasts["method"], forecasts["forecast_date"])]
+    var_summary = backtest.statistics.reset_index()
+    for column in ("p01", "p11"):
+        var_summary[column] = var_summary[column].astype(object).where(var_summary[column].notna(), "not_identified")
+    var_summary["transition_probability_status"] = np.where(var_summary["independence_identified"], "identified", "unobserved_state")
+    var_summary["forecast_start"] = backtest.windows.index[0]
+    var_summary["forecast_end"] = backtest.windows.index[-1]
+    var_summary["scenario_count"] = var_summary["method"].map(
+        {method: len(backtest.latest_scenarios[method]) for method in VAR_METHODS})
+    var_summary = _with_metadata(var_summary, backtest_context)
+    risk_rows = []
+    latest = backtest.records.loc[backtest.records["forecast_date"] == backtest.windows.index[-1]]
+    for method in VAR_METHODS:
+        holding_vars = latest.loc[latest["method"] == method].set_index("holding")["forecast_var"]
+        for holding in HOLDINGS:
+            risk_rows.append({"method": method, "holding": holding, "metric": "allocated_standalone_var", "value_usd": holding_vars[holding]})
+        for metric, column in (("standalone_var_sum", "allocated_standalone_var_sum"),
+                                ("portfolio_var", "portfolio_var"), ("diversification_effect", "diversification_effect")):
+            risk_rows.append({"method": method, "holding": "Portfolio", "metric": metric,
+                              "value_usd": backtest.diversification.loc[method, column]})
+    attribution = backtest.attribution
+    for holding, row in attribution.contributions.iterrows():
+        risk_rows.append({"method": "parametric", "holding": holding, "metric": "euler_var_contribution", "value_usd": row["euler_contribution"]})
+    for metric, value in (("contribution_sum", attribution.contribution_sum), ("attribution_residual", attribution.residual)):
+        risk_rows.append({"method": "parametric", "holding": "Portfolio", "metric": metric, "value_usd": value})
+    risk_summary = _with_metadata(pd.DataFrame(risk_rows), backtest_context)
+    risk_summary["forecast_date"] = backtest.windows.index[-1]
+    risk_summary["forecast_origin"] = backtest.windows.iloc[-1]["forecast_origin"]
+    risk_summary["scenario_count"] = risk_summary["method"].map(
+        {method: len(backtest.latest_scenarios[method]) for method in VAR_METHODS})
+    risk_summary["position_bump_relative"] = [str(attribution.relative_step) if metric.startswith("euler") or metric in ("contribution_sum", "attribution_residual") else "not_applicable"
+                                               for metric in risk_summary["metric"]]
+    tables = {"data_quality.csv": data_quality_table(result), "terminal_paths.csv": paths,
+              "terminal_summary.csv": terminal_summary, "var_forecasts.csv": forecasts,
+              "var_summary.csv": var_summary, "risk_summary.csv": risk_summary}
+    for name, frame in tables.items():
+        if frame.empty or frame.columns.has_duplicates or frame.isna().any().any():
+            raise DataValidationError(f"Incomplete report table: {name}")
+        numeric = frame.select_dtypes(include="number").to_numpy()
+        if not np.isfinite(numeric).all():
+            raise DataValidationError(f"Nonfinite report values: {name}")
+    return tables
+
+
+def render_figures(result: CompleteAnalysis) -> dict[str, bytes]:
+    """Render all three Matplotlib figures in memory and close every figure."""
+    os.environ["MPLCONFIGDIR"] = str(PROJECT_DIRECTORY / ".venv" / "matplotlib-cache")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import StrMethodFormatter
+
+    terminal, backtest = result.terminal, result.backtest
+    source_caption = (f"Sources: Federal Reserve fitted yields; Yahoo Finance via yfinance. "
+                      f"Sample: {result.market.levels.index[0].date()} to {result.market.levels.index[-1].date()}.")
+    images = {}
+
+    def save(figure, name, description):
+        buffer = BytesIO()
+        figure.savefig(buffer, format="png", dpi=FIGURE_DPI,
+                       metadata={"Title": name, "Description": description})
+        images[name] = buffer.getvalue()
+
+    navy, gold, teal = "#234b70", "#d68c27", "#16887d"
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
     try:
-        market = retrieve_market_data()
-        analysis = run_terminal_analysis(market, args.allocation_date) if args.terminal else None
-        if analysis is None:
-            allocation_date = args.allocation_date or market.levels.index[0]
-            allocation = allocate_portfolio(market.levels, allocation_date)
-        else:
-            allocation = analysis.correlated.allocation
-        valuation_date = args.valuation_date or allocation.allocation_date
-        values = holding_values(allocation, market.levels, valuation_date)
-    except (DataValidationError, DataRetrievalError) as exc:
-        parser.exit(1, f"Data/pricing foundation failed: {exc}\n")
-    print("Sources: Federal Reserve fitted zero-coupon yields; Yahoo Finance via yfinance.")
-    print(f"Requested inclusive dates: {ANALYSIS_START} through {ANALYSIS_END}")
-    print(
-        f"Common valid dates: {market.levels.index[0].date()} through "
-        f"{market.levels.index[-1].date()}; {len(market.levels)} levels, "
-        f"{len(market.risk_factor_changes)} aligned changes."
-    )
-    for report in market.coverage:
-        print(
-            f"{report.source}: valid coverage {report.first_valid_date.date()} through "
-            f"{report.last_valid_date.date()}; boundary shortfalls: "
-            f"{', '.join(report.boundary_shortfalls) or 'none'}"
-        )
-        for label, dates in (
-            ("Incomplete observation dates", report.incomplete_dates),
-            ("Absent weekdays (may be holidays)", report.absent_weekdays),
-        ):
-            print(f"  {label}: {', '.join(str(x.date()) for x in dates) or 'none'}")
-    print("Dates dropped in alignment: " + (
-        ", ".join(str(x.date()) for x in market.dropped_dates) or "none"
-    ))
-    print(
-        f"Reporting normalization: USD {allocation.initial_value:,.2f}; "
-        "return and risk percentages are invariant to this scale."
-    )
-    print(f"Allocation date: {allocation.allocation_date.date()}")
-    print(f"Holding values on {_as_date(valuation_date, 'valuation_date').date()} (USD):")
-    print(values.to_string(float_format=lambda value: f"{value:,.2f}"))
-    print(f"Portfolio value: USD {values.sum():,.2f}")
-    print("Latest aligned yield changes (basis points):")
-    print(market.yield_changes_bp.tail(1).to_string())
-    if analysis is not None:
-        calibration = analysis.calibration
-        correction = calibration.covariance_adjustment
-        print(
-            f"Gaussian calibration: {len(calibration.sample)} aligned changes, "
-            f"{calibration.sample.index[0].date()} through {calibration.sample.index[-1].date()}; "
-            f"sample std/covariance ddof={ESTIMATION_DDOF}."
-        )
-        print(
-            f"Covariance correction: {correction.clipped_eigenvalues} negative eigenvalues clipped; "
-            f"original minimum={correction.original_min_eigenvalue:.6g}; "
-            f"tolerance={correction.tolerance:.6g}; "
-            f"Frobenius correction={correction.correction_frobenius_norm:.6g}."
-        )
-        for result in (analysis.standalone, analysis.correlated):
-            print(
-                f"{result.purpose}: {len(result.paths)} paths, {result.horizon_days} trading days; "
-                f"seed={result.seed}; Treasury maturities={TERMINAL_MATURITIES}."
-            )
-            print("Summary: unit prices, adjusted ETF prices, USD values, decimal simple returns.")
-            print(result.summary.to_string())
+        fig.subplots_adjust(left=.07, right=.98, top=.79, bottom=.11, hspace=.38, wspace=.25)
+        fig.suptitle("One-year terminal return distributions", fontsize=19, y=.97)
+        caption = (f"Allocation: {terminal.correlated.allocation.allocation_date.date()} | "
+                   f"{len(terminal.correlated.paths):,} paths | {TRADING_DAYS} trading days\n"
+                   f"Calibration: {len(terminal.calibration.sample)} changes, "
+                   f"{terminal.calibration.sample.index[0].date()} to {terminal.calibration.sample.index[-1].date()}")
+        fig.text(.5, .89, caption, ha="center", va="center", fontsize=10)
+        for ax, holding, label in zip(axes.flat, RISK_IDENTIFIERS, PLOT_HOLDING_LABELS):
+            if holding != "Portfolio":
+                ax.hist(terminal.standalone.paths[holding, "return"] * 100, bins=55,
+                        density=True, alpha=.58, color=gold, label="Standalone marginal")
+            ax.hist(terminal.correlated.paths[holding, "return"] * 100, bins=55,
+                    density=True, alpha=.64, color=navy, label="Correlated model")
+            ax.axvline(0, color="#737373", linewidth=.8, linestyle=":")
+            ax.set(title=label, xlabel="Terminal return (%)", ylabel="Density")
+            ax.grid(axis="y", alpha=.18)
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, .85), ncol=2, frameon=False)
+        fig.text(.5, .035, source_caption + "\nTables report 1st/50th/99th percentiles; returns include bond aging and reinvested ETF distributions.",
+                 ha="center", fontsize=9)
+        save(fig, "terminal_distributions.png", caption + "\n" + source_caption)
+    finally:
+        plt.close(fig)
+
+    fig, axes = plt.subplots(3, 2, figsize=(15, 11))
+    try:
+        fig.subplots_adjust(left=.08, right=.98, top=.80, bottom=.09, hspace=.48, wspace=.24)
+        fig.suptitle("One-day VaR backtests: realized P&L and loss thresholds", fontsize=18, y=.97)
+        caption = (f"99% loss VaR; plotted thresholds = -VaR | {len(backtest.windows)} forecasts, "
+                   f"{backtest.windows.index[0].date()} to {backtest.windows.index[-1].date()}\n"
+                   f"{CALIBRATION_WINDOW}-change rolling windows | "
+                   f"{len(backtest.latest_scenarios['parametric']):,} Gaussian / 500 historical scenarios per forecast")
+        fig.text(.5, .91, caption, ha="center", va="center", fontsize=10)
+        for ax, holding, label in zip(axes.flat, RISK_IDENTIFIERS, PLOT_HOLDING_LABELS):
+            forecasts = backtest.records.loc[backtest.records["holding"] == holding]
+            parametric = forecasts.loc[forecasts["method"] == "parametric"].sort_values("forecast_date")
+            historical = forecasts.loc[forecasts["method"] == "historical"].sort_values("forecast_date")
+            ax.plot(parametric["forecast_date"], parametric["realized_pnl"], color=navy, linewidth=.8, label="Realized P&L")
+            for frame, color, label_method, marker in ((parametric, gold, "Parametric", "o"),
+                                                        (historical, teal, "Historical", "x")):
+                ax.plot(frame["forecast_date"], -frame["forecast_var"], color=color, linewidth=1,
+                        linestyle="--", label=label_method + " -VaR")
+                breaches = frame.loc[frame["exception"]]
+                ax.scatter(breaches["forecast_date"], breaches["realized_pnl"], marker=marker,
+                           color=color, s=30, zorder=4, label=label_method + " exception")
+            ax.axhline(0, color="#737373", linewidth=.6)
+            ax.set_title(label)
+            ax.set_ylabel("One-day P&L / threshold (USD)")
+            ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+            locator = mdates.AutoDateLocator(minticks=3, maxticks=5)
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+            ax.grid(alpha=.16)
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, .865), ncol=5, frameon=False, fontsize=9)
+        fig.text(.5, .025, source_caption + f"\nBuy-and-hold from {backtest.allocation.allocation_date.date()}; "
+                 "aligned steps/252 for bond aging; no rebalancing.", ha="center", fontsize=9)
+        save(fig, "var_backtests.png", caption + "\n" + source_caption)
+    finally:
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(13, 7))
+    try:
+        fig.subplots_adjust(left=.09, right=.71, top=.78, bottom=.18)
+        contribution = backtest.attribution
+        values = contribution.contributions["euler_contribution"].to_numpy()
+        bars = ax.bar(PLOT_HOLDING_LABELS[:5], values, color=[navy if value >= 0 else gold for value in values])
+        ax.bar_label(bars, labels=[f"{value:,.0f}" for value in values], padding=4, fontsize=10)
+        ax.axhline(0, color="#737373", linewidth=.8)
+        ax.set_ylabel("Euler VaR contribution (USD)")
+        ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+        ax.grid(axis="y", alpha=.18)
+        ax.margins(y=.15)
+        fig.suptitle("Latest parametric 99% one-day VaR contributions", fontsize=18, y=.97)
+        caption = (f"Forecast: {backtest.windows.index[-1].date()} | Origin: {backtest.windows.iloc[-1]['forecast_origin'].date()}\n"
+                   f"{CALIBRATION_WINDOW}-change window | {len(backtest.windows)} forecasts | "
+                   f"{len(backtest.latest_scenarios['parametric']):,} common Gaussian scenarios")
+        fig.text(.5, .88, caption, ha="center", fontsize=10)
+        reconciliation = (f"Portfolio VaR\nUSD {contribution.portfolio_var:,.2f}\n\n"
+                          f"Contribution sum\nUSD {contribution.contribution_sum:,.2f}\n\n"
+                          f"Residual (VaR - sum)\nUSD {contribution.residual:+.6g}\n\n"
+                          "Residual is disclosed;\ncontributions are not rescaled.")
+        fig.text(.76, .74, reconciliation, va="top", fontsize=12)
+        fig.text(.5, .045, source_caption + f"\nCentral position bumps: +/-{contribution.relative_step:.2%}; "
+                 "fixed positions; full revaluation; common scenarios.", ha="center", fontsize=9)
+        save(fig, "risk_contributions.png", caption + "\n" + reconciliation + "\n" + source_caption)
+    finally:
+        plt.close(fig)
+    return images
+
+
+def write_outputs(tables: Mapping[str, pd.DataFrame], figures: Mapping[str, bytes]) -> tuple[Path, ...]:
+    """Write exactly the configured files after every in-memory result is complete."""
+    if set(tables) != set(CSV_FILENAMES) or set(figures) != set(FIGURE_FILENAMES):
+        raise DataValidationError("Output set must contain exactly the six CSVs and three PNGs")
+    payloads = {name: frame.to_csv(index=False, date_format="%Y-%m-%d", float_format="%.17g").encode("utf-8")
+                for name, frame in tables.items()}
+    payloads.update(figures)
+    if OUTPUT_DIRECTORY.exists():
+        unexpected = [path.name for path in OUTPUT_DIRECTORY.iterdir()
+                      if not path.is_file() or path.name not in OUTPUT_FILENAMES]
+        if unexpected:
+            raise DataValidationError(f"Unexpected entries in outputs/: {unexpected}")
+    OUTPUT_DIRECTORY.mkdir(exist_ok=True)
+    for name in OUTPUT_FILENAMES:
+        (OUTPUT_DIRECTORY / name).write_bytes(payloads[name])
+    return tuple(OUTPUT_DIRECTORY / name for name in OUTPUT_FILENAMES)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """The single entry point: finish all analyses and prepare reports before writing."""
+    parser = argparse.ArgumentParser(description="Run the complete fixed multi-asset simulation and VaR analysis.")
+    parser.parse_args(argv)
+    try:
+        print(f"Analyzing {ANALYSIS_START} through {ANALYSIS_END}; retrieving and validating sources...", flush=True)
+        result = run_full_analysis()
+        print(f"Analysis complete: {len(result.market.risk_factor_changes)} aligned changes; "
+              f"{len(result.terminal.correlated.paths):,} terminal paths; {len(result.backtest.windows)} forecasts.", flush=True)
+        tables = build_output_tables(result)
+        figures = render_figures(result)
+        paths = write_outputs(tables, figures)
+    except (DataValidationError, DataRetrievalError, OSError) as exc:
+        parser.exit(1, f"Analysis failed: {exc}\n")
+    print(f"Wrote {len(paths)} result files to {OUTPUT_DIRECTORY}")
+    print(f"Latest parametric portfolio VaR: USD {result.backtest.attribution.portfolio_var:,.2f}; "
+          f"attribution residual: USD {result.backtest.attribution.residual:+.6g}")
     return 0
 
 

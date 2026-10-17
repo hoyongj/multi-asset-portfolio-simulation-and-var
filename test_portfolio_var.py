@@ -1,4 +1,4 @@
-r"""Synthetic, offline tests for the data and pricing foundation.
+r"""Synthetic, offline tests for the complete analysis and reporting pipeline.
 
 Run with: .venv\Scripts\python.exe -m unittest -v
 All retrieval calls are mocked; no market data or external local files are used.
@@ -7,7 +7,7 @@ All retrieval calls are mocked; no market data or external local files are used.
 import io
 import math
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
@@ -433,19 +433,25 @@ class RetrievalAndExecutionTests(SyntheticTestCase):
 
     @patch("portfolio_var.fetch_etf_prices")
     @patch("portfolio_var.fetch_treasury_yields")
-    def test_retrieval_pipeline_and_executable_report(self, yields, etfs):
+    def test_retrieval_pipeline_and_insufficient_data_failure_before_outputs(self, yields, etfs):
         yields.return_value = self.yields
         etfs.return_value = self.etfs
         market = pv.retrieve_market_data(self.start, self.end)
         self.assertEqual(len(market.risk_factor_changes), 5)
         yields.assert_called_once_with(self.start, self.end)
         etfs.assert_called_once_with(self.start, self.end)
-        output = io.StringIO()
-        with patch("portfolio_var.retrieve_market_data", return_value=market), redirect_stdout(output):
-            self.assertEqual(pv.main([]), 0)
-        self.assertIn("1,000,000.00", output.getvalue())
-        self.assertIn("invariant to this scale", output.getvalue())
-        self.assertIn("basis points", output.getvalue())
+        error = io.StringIO()
+        with patch("portfolio_var.retrieve_market_data", return_value=market), \
+                patch("portfolio_var.run_terminal_analysis") as terminal, \
+                patch("portfolio_var.write_outputs") as writer, \
+                redirect_stdout(io.StringIO()), redirect_stderr(error):
+            with self.assertRaises(SystemExit) as exit_status:
+                pv.main([])
+        self.assertEqual(exit_status.exception.code, 1)
+        self.assertIn("At least 750 aligned changes", error.getvalue())
+        self.assertIn("supplied 5", error.getvalue())
+        terminal.assert_not_called()
+        writer.assert_not_called()
 
 
 class GaussianCalibrationTests(unittest.TestCase):
@@ -668,16 +674,6 @@ class TerminalSimulationTests(unittest.TestCase):
             earlier = pv.allocate_portfolio(self.market.levels, self.market.levels.index[-2])
             with self.assertRaisesRegex(pv.DataValidationError, "after the allocation"):
                 function(self.model, earlier, self.market.levels, path_count=4)
-
-    def test_executable_terminal_option_reports_in_memory_summaries(self):
-        analysis = pv.run_terminal_analysis(self.market, path_count=4)
-        output = io.StringIO()
-        with patch("portfolio_var.retrieve_market_data", return_value=self.market), \
-                patch("portfolio_var.run_terminal_analysis", return_value=analysis), redirect_stdout(output):
-            self.assertEqual(pv.main(["--terminal"]), 0)
-        self.assertIn("500 aligned changes", output.getvalue())
-        self.assertIn("correlated_terminal_simulation: 4 paths, 252 trading days", output.getvalue())
-        self.assertIn("Covariance correction:", output.getvalue())
 
 
 class CoverageStatisticsTests(unittest.TestCase):
@@ -929,6 +925,151 @@ class BacktestIndependenceTests(unittest.TestCase):
                 bonds = result.records.loc[result.records["holding"].isin(pv.TREASURY_HOLDINGS)]
                 self.assertTrue((bonds["forecast_var"] < 0).all())
                 self.assertTrue((bonds["realized_pnl"] > 0).all())
+
+
+class ReportingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        market = synthetic_terminal_market()
+        cls.result = pv.CompleteAnalysis(
+            market, pv.run_terminal_analysis(market, path_count=16),
+            pv.backtest_var(market, scenario_count=32, forecast_count=3),
+        )
+        cls.tables = pv.build_output_tables(cls.result)
+
+    def test_six_complete_tables_have_explicit_units_and_analysis_context(self):
+        self.assertEqual(set(self.tables), set(pv.CSV_FILENAMES))
+        for name, frame in self.tables.items():
+            with self.subTest(table=name):
+                self.assertFalse(frame.empty)
+                self.assertFalse(frame.isna().any().any())
+                self.assertTrue(np.isfinite(frame.select_dtypes(include="number").to_numpy()).all())
+                for column in ("requested_start", "requested_end", "sample_start", "sample_end",
+                               "confidence_level", "reporting_notional_usd", "master_seed"):
+                    self.assertIn(column, frame)
+                restored = pd.read_csv(io.StringIO(frame.to_csv(index=False)))
+                self.assertEqual(restored.shape, frame.shape)
+                self.assertFalse(restored.isna().any().any())
+        paths, summary = self.tables["terminal_paths.csv"], self.tables["terminal_summary.csv"]
+        self.assertEqual(len(paths), 16)
+        self.assertEqual(len(summary), 36)
+        self.assertEqual(set(summary["count"]), {16})
+        self.assertEqual(set(summary["horizon_trading_days"]), {252})
+        self.assertEqual(set(summary["calibration_changes"]), {500})
+        self.assertNotIn("standalone_Portfolio_value_usd", paths)
+        self.assertIn("correlated_Portfolio_return_decimal", paths)
+        row = summary.set_index(["analysis", "holding", "metric"]).loc[("correlated", "Treasury_2Y", "unit_price")]
+        self.assertEqual(row["unit"], "USD per USD 1 face")
+        self.assertAlmostEqual(row["mean"], paths["correlated_Treasury_2Y_unit_price_usd_per_face"].mean())
+        self.assertEqual(set(self.tables["var_forecasts.csv"]["scenario_count"]), {32, 500})
+        forecasts = self.tables["var_forecasts.csv"]
+        for date, group in forecasts.loc[forecasts["method"] == "parametric"].groupby("forecast_date"):
+            self.assertEqual(set(group["forecast_seed"]), {str(self.result.backtest.windows.loc[date, "parametric_seed"])})
+
+    def test_data_quality_reports_raw_missing_cells_and_dropped_dates(self):
+        yields, etfs = synthetic_sources()
+        yields.iloc[1, 0] = np.nan
+        yields.iloc[1, 1] = np.nan
+        market = pv.prepare_market_data(yields, etfs, yields.index[0], yields.index[-1])
+        changed = replace(self.result, market=market)
+        quality = pv.data_quality_table(changed).set_index(["section", "subject", "check"])
+        self.assertEqual(market.coverage[0].missing_value_count, 2)
+        self.assertEqual(quality.loc[("source", market.coverage[0].source, "missing_values"), "value"], "2")
+        self.assertEqual(quality.loc[("alignment", "all eight factors", "dropped_dates"), "value"], "1")
+        self.assertEqual(quality.loc[("alignment", "all eight factors", "missing_required_values"), "value"], "0")
+
+    def test_unidentified_transition_probability_is_explicit_and_statistics_stay_finite(self):
+        statistics = self.result.backtest.statistics.copy()
+        statistics.loc[:, "p11"] = np.nan
+        statistics.loc[:, "independence_identified"] = False
+        result = replace(self.result, backtest=replace(self.result.backtest, statistics=statistics))
+        summary = pv.build_output_tables(result)["var_summary.csv"]
+        self.assertEqual(set(summary["p11"]), {"not_identified"})
+        self.assertEqual(set(summary["transition_probability_status"]), {"unobserved_state"})
+        columns = [name for name in summary if name.endswith("_lr") or name.endswith("_p_value")]
+        self.assertEqual(len(columns), 6)
+        self.assertTrue(np.isfinite(summary[columns].to_numpy()).all())
+
+    def test_risk_table_has_five_contributions_and_disclosed_residual(self):
+        table = self.tables["risk_summary.csv"]
+        self.assertEqual(len(table), 23)
+        contributions = table.loc[table["metric"] == "euler_var_contribution"]
+        self.assertEqual(tuple(contributions["holding"]), pv.HOLDINGS)
+        self.assertEqual(set(contributions["position_bump_relative"]), {str(pv.ATTRIBUTION_RELATIVE_STEP)})
+        for method in pv.VAR_METHODS:
+            rows = table.loc[table["method"] == method]
+            allocated = rows.loc[rows["metric"] == "allocated_standalone_var", "value_usd"].sum()
+            portfolio = rows.set_index("metric").loc["portfolio_var", "value_usd"]
+            diversification = rows.set_index("metric").loc["diversification_effect", "value_usd"]
+            self.assertAlmostEqual(allocated - portfolio, diversification)
+        totals = table.loc[(table["method"] == "parametric") & (table["holding"] == "Portfolio")].set_index("metric")
+        self.assertAlmostEqual(contributions["value_usd"].sum(), totals.loc["contribution_sum", "value_usd"])
+        self.assertAlmostEqual(totals.loc["portfolio_var", "value_usd"] - totals.loc["contribution_sum", "value_usd"],
+                               totals.loc["attribution_residual", "value_usd"])
+
+    def test_all_three_figures_render_in_memory_and_close(self):
+        images = pv.render_figures(self.result)
+        self.assertEqual(set(images), set(pv.FIGURE_FILENAMES))
+        for content in images.values():
+            self.assertTrue(content.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertGreater(len(content), 10_000)
+        import matplotlib.pyplot as plt
+        self.assertEqual(plt.get_fignums(), [])
+
+    def test_complete_analysis_retrieves_once_and_uses_production_defaults(self):
+        market = synthetic_terminal_market(observations=751)
+        with patch("portfolio_var.retrieve_market_data", return_value=market) as retrieve, \
+                patch("portfolio_var.run_terminal_analysis", return_value=self.result.terminal) as terminal, \
+                patch("portfolio_var.backtest_var", return_value=self.result.backtest) as backtest:
+            result = pv.run_full_analysis()
+        retrieve.assert_called_once_with()
+        terminal.assert_called_once_with(market)
+        backtest.assert_called_once_with(market)
+        self.assertIs(result.market, market)
+        self.assertEqual(pv.SIMULATION_PATHS, 10_000)
+        self.assertEqual(pv.TRADING_DAYS, 252)
+
+    def test_default_command_finishes_all_in_memory_steps_before_writing(self):
+        calls = []
+        images = {name: b"PNG" for name in pv.FIGURE_FILENAMES}
+
+        def analysis():
+            calls.append("analysis")
+            return self.result
+
+        def tables(result):
+            self.assertIs(result, self.result)
+            calls.append("tables")
+            return self.tables
+
+        def render(result):
+            self.assertIs(result, self.result)
+            calls.append("figures")
+            return images
+
+        def write(frames, figures):
+            self.assertIs(frames, self.tables)
+            self.assertIs(figures, images)
+            calls.append("write")
+            return tuple(pv.OUTPUT_DIRECTORY / name for name in pv.OUTPUT_FILENAMES)
+
+        with patch("portfolio_var.run_full_analysis", side_effect=analysis), \
+                patch("portfolio_var.build_output_tables", side_effect=tables), \
+                patch("portfolio_var.render_figures", side_effect=render), \
+                patch("portfolio_var.write_outputs", side_effect=write), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(pv.main([]), 0)
+        self.assertEqual(calls, ["analysis", "tables", "figures", "write"])
+        self.assertIn("Wrote 9 result files", output.getvalue())
+
+    def test_rendering_failure_never_calls_output_writer(self):
+        with patch("portfolio_var.run_full_analysis", return_value=self.result), \
+                patch("portfolio_var.render_figures", side_effect=OSError("cannot render")), \
+                patch("portfolio_var.write_outputs") as writer, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_status:
+                pv.main([])
+        self.assertEqual(exit_status.exception.code, 1)
+        writer.assert_not_called()
 
 
 if __name__ == "__main__":

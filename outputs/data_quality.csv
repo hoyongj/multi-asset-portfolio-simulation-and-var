@@ -1,0 +1,87 @@
+section,subject,check,value,unit,details,requested_start,requested_end,sample_start,sample_end,confidence_level,reporting_notional_usd,master_seed
+source,Federal Reserve,first_valid_date,2022-09-01,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,last_valid_date,2026-08-31,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,in_period_rows,1043,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,complete_rows,998,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,alignment_dropped_rows,48,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,duplicate_dates,0,count,Duplicates are rejected before alignment,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,missing_values,270,cells,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,incomplete_rows,45,rows,2022-09-05;2022-10-10;2022-11-11;2022-11-24;2022-12-26;2023-01-02;2023-01-16;2023-02-20;2023-05-29;2023-06-19;2023-07-04;2023-09-04;2023-10-09;2023-11-23;2023-12-25;2024-01-01;2024-01-15;2024-02-19;2024-03-29;2024-05-27;2024-06-19;2024-07-04;2024-09-02;2024-10-14;2024-11-11;2024-11-28;2024-12-25;2025-01-01;2025-01-20;2025-02-17;2025-04-18;2025-05-26;2025-06-19;2025-07-04;2025-09-01;2025-10-13;2025-11-11;2025-11-27;2025-12-25;2026-01-01;2026-01-19;2026-02-16;2026-05-25;2026-06-19;2026-07-03,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,absent_weekdays,0,days,none; absent weekdays can be legitimate holidays,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Federal Reserve,source_period_deviation,none,text,Boundary shortfalls compare complete observations with requested weekdays; no dates are fabricated,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,first_valid_date,2022-09-01,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,last_valid_date,2026-08-31,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,in_period_rows,1002,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,complete_rows,1002,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,alignment_dropped_rows,7,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,duplicate_dates,0,count,Duplicates are rejected before alignment,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,missing_values,0,cells,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,incomplete_rows,0,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,absent_weekdays,41,days,2022-09-05;2022-11-24;2022-12-26;2023-01-02;2023-01-16;2023-02-20;2023-04-07;2023-05-29;2023-06-19;2023-07-04;2023-09-04;2023-11-23;2023-12-25;2024-01-01;2024-01-15;2024-02-19;2024-03-29;2024-05-27;2024-06-19;2024-07-04;2024-09-02;2024-11-28;2024-12-25;2025-01-01;2025-01-09;2025-01-20;2025-02-17;2025-04-18;2025-05-26;2025-06-19;2025-07-04;2025-09-01;2025-11-27;2025-12-25;2026-01-01;2026-01-19;2026-02-16;2026-04-03;2026-05-25;2026-06-19;2026-07-03; absent weekdays can be legitimate holidays,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance LQD,source_period_deviation,none,text,Boundary shortfalls compare complete observations with requested weekdays; no dates are fabricated,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,first_valid_date,2022-09-01,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,last_valid_date,2026-08-31,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,in_period_rows,1002,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,complete_rows,1002,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,alignment_dropped_rows,7,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,duplicate_dates,0,count,Duplicates are rejected before alignment,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,missing_values,0,cells,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,incomplete_rows,0,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,absent_weekdays,41,days,2022-09-05;2022-11-24;2022-12-26;2023-01-02;2023-01-16;2023-02-20;2023-04-07;2023-05-29;2023-06-19;2023-07-04;2023-09-04;2023-11-23;2023-12-25;2024-01-01;2024-01-15;2024-02-19;2024-03-29;2024-05-27;2024-06-19;2024-07-04;2024-09-02;2024-11-28;2024-12-25;2025-01-01;2025-01-09;2025-01-20;2025-02-17;2025-04-18;2025-05-26;2025-06-19;2025-07-04;2025-09-01;2025-11-27;2025-12-25;2026-01-01;2026-01-19;2026-02-16;2026-04-03;2026-05-25;2026-06-19;2026-07-03; absent weekdays can be legitimate holidays,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+source,Yahoo Finance SPY,source_period_deviation,none,text,Boundary shortfalls compare complete observations with requested weekdays; no dates are fabricated,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,aligned_levels,995,rows,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,aligned_changes,994,changes,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,required_backtest_changes,750,changes,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,duplicate_dates,0,count,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,missing_required_values,0,cells,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,nonfinite_changes,0,cells,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,dropped_dates,48,days,2022-09-05;2022-10-10;2022-11-11;2022-11-24;2022-12-26;2023-01-02;2023-01-16;2023-02-20;2023-04-07;2023-05-29;2023-06-19;2023-07-04;2023-09-04;2023-10-09;2023-11-23;2023-12-25;2024-01-01;2024-01-15;2024-02-19;2024-03-29;2024-05-27;2024-06-19;2024-07-04;2024-09-02;2024-10-14;2024-11-11;2024-11-28;2024-12-25;2025-01-01;2025-01-09;2025-01-20;2025-02-17;2025-04-18;2025-05-26;2025-06-19;2025-07-04;2025-09-01;2025-10-13;2025-11-11;2025-11-27;2025-12-25;2026-01-01;2026-01-19;2026-02-16;2026-04-03;2026-05-25;2026-06-19;2026-07-03,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,maximum_calendar_gap,4,days,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,policy,Common valid dates before differences; no filling,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,required_level_columns,SVENY01;SVENY02;SVENY04;SVENY05;SVENY09;SVENY10;LQD_Close;LQD_Adj Close;SPY_Close;SPY_Adj Close,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,ordered_change_factors,SVENY01;SVENY02;SVENY04;SVENY05;SVENY09;SVENY10;LQD;SPY,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+alignment,all eight factors,date_spans,"Changes span consecutive retained dates, including source-calendar gaps",text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+validation,all sources,checks,PASS,text,"ISO dates, required columns, unique dates/columns, real numeric types, finite values, positive ETF prices, source coverage",2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Treasury yields,units_and_method,Source percentage yields / 100 = decimal yields,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Treasury changes,units_and_method,Decimal-yield units internally; multiply by 10000 for basis points,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,ETF changes,units_and_method,Natural log of consecutive aligned Adj Close ratios; decimal log return,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Treasury pricing,units_and_method,"exp(-decimal yield * remaining years), USD per USD 1 face",text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Maturity interpolation,units_and_method,"Linear yield interpolation between bracketing fitted tenors, including 1-2, 4-5, 9-10; no extrapolation",text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Terminal aging,units_and_method,"252 trading days = 1 year; remaining maturities 1, 4, 9 years",text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Backtest aging,units_and_method,"Aligned forecast steps / 252 from first forecast origin, in scenarios AND realized valuations",text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Historical helper default,units_and_method,ACT/365 Fixed; complete backtest explicitly supplies the aligned-step clock,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,ETF valuation,units_and_method,Initial allocation / Close gives shares; all later values use initial allocation * Adj Close ratio,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+convention,Returns and risk,units_and_method,CSV returns are decimal; dollar loss VaR and P&L are USD; charts explicitly label percentages,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+randomness,standalone_terminal_simulation,child_seed,16138347438539916964,integer seed,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+randomness,correlated_terminal_simulation,child_seed,134183728835869882,integer seed,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+randomness,rolling_parametric_var,child_seed,11601846009883706861,integer seed,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+randomness,risk_attribution,child_seed,3747978530954135749,integer seed,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+randomness,rolling VaR,forecast_seed_rule,"SeedSequence(rolling child seed, spawn_key=(global eligible forecast ordinal,)); uint64 state",text,Each parametric forecast seed is recorded in var_forecasts.csv,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+randomness,attribution,draws,No new draws: reuse latest parametric full-revaluation losses,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal,allocation_date,2026-08-31,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:Treasury_2Y,initial_weight,0.1,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:Treasury_2Y,fixed_quantity,108899.79919394046,USD face,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:Treasury_5Y,initial_weight,0.1,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:Treasury_5Y,fixed_quantity,125124.61816321504,USD face,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:Treasury_10Y,initial_weight,0.1,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:Treasury_10Y,fixed_quantity,162029.78656048153,USD face,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:LQD,initial_weight,0.3,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:LQD,fixed_quantity,2824.5928122209957,initial shares,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:SPY,initial_weight,0.4,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,terminal:SPY,fixed_quantity,521.4783995381046,initial shares,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest,allocation_date,2025-08-28,date,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:Treasury_2Y,initial_weight,0.1,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:Treasury_2Y,fixed_quantity,107522.2911910205,USD face,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:Treasury_5Y,initial_weight,0.1,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:Treasury_5Y,fixed_quantity,120227.42842818491,USD face,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:Treasury_10Y,initial_weight,0.1,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:Treasury_10Y,fixed_quantity,153285.19195215192,USD face,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:LQD,initial_weight,0.3,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:LQD,fixed_quantity,2722.3231243908426,initial shares,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:SPY,initial_weight,0.4,decimal,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+allocation,backtest:SPY,fixed_quantity,616.408818551332,initial shares,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+numerics,terminal covariance,clipped_eigenvalues,0,count,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+numerics,terminal covariance,correction_frobenius_norm,0.0,native covariance units,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+numerics,rolling covariance,clipped_eigenvalues_total,0,count,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+numerics,rolling covariance,maximum_correction_frobenius_norm,0.0,native covariance units,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
+numerics,covariance,policy,Reject material indefiniteness; clip only negative eigenvalues within 10*n*eps*eigenvalue scale to zero; no jitter,text,none,2022-09-01,2026-08-31,2022-09-01,2026-08-31,0.98999999999999999,1000000,42
