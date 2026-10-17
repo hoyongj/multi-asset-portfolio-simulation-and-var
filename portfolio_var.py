@@ -28,6 +28,13 @@ covariance use the same observations (ddof=1). Daily draws are IID through time.
 Standalone draws are independent marginal analyses; their summed portfolio is an
 independence diagnostic. The portfolio analysis uses the full eight-factor model.
 
+Rolling backtests allocate once at the first forecast origin and age bonds by
+aligned steps/252 for both scenario and realized valuations. Each forecast excludes
+its realized change from the immediately preceding 500-change estimation window.
+VaR is a signed 99% dollar loss quantile, and exceptions strictly exceed it.
+Latest-forecast Euler attribution uses common full-revaluation scenarios and
+central proportional position bumps, reporting the unnormalized residual.
+
 Importing does not retrieve data, seed global random state, or write analysis files.
 Executing reports the foundation; --terminal also simulates terminal distributions.
 All paths, summaries, and numerical covariance corrections remain in memory.
@@ -48,6 +55,8 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+from scipy.special import xlog1py, xlogy
+from scipy.stats import chi2
 
 
 ANALYSIS_START = "2022-09-01"
@@ -74,6 +83,10 @@ STANDALONE_FACTOR_COLUMNS = TERMINAL_YIELD_COLUMNS + ETF_TICKERS
 ESTIMATION_DDOF = 1
 PSD_ROUNDOFF_MULTIPLIER = 10.0
 SUMMARY_PERCENTILES = (0.01, 0.5, 0.99)
+VAR_METHODS = ("parametric", "historical")
+RISK_IDENTIFIERS = HOLDINGS + ("Portfolio",)
+VAR_QUANTILE_METHOD = "linear"
+ATTRIBUTION_RELATIVE_STEP = 1e-4
 CALENDAR_DAYS_PER_YEAR = 365.0
 BASIS_POINTS_PER_DECIMAL = 10_000.0
 MASTER_SEED = 42
@@ -244,6 +257,46 @@ class TerminalAnalysis:
     calibration: GaussianCalibration
     standalone: TerminalSimulation
     correlated: TerminalSimulation
+
+
+@dataclass(frozen=True)
+class VaRAttribution:
+    """Common-scenario Euler finite differences, in USD, with an unscaled residual.
+
+    residual = portfolio_var - contribution_sum. Contributions are never rescaled
+    to force reconciliation; a finite bump can cross empirical quantile ranks.
+    """
+
+    contributions: pd.DataFrame
+    portfolio_var: float
+    contribution_sum: float
+    residual: float
+    relative_step: float
+
+
+@dataclass(frozen=True)
+class BacktestResult:
+    """Rolling forecasts and diagnostics; all tables remain in memory.
+
+    Backtest aging uses aligned steps / 252 from the first forecast origin,
+    including for realized valuations. This explicit trading clock differs from
+    holding_values' default ACT/365 clock: source-calendar gaps can make 250
+    aligned changes span more than 365 days, beyond the supplied 1-year tenor.
+    Each forecast ages all bonds by exactly 1/252 year; no extrapolation occurs.
+    """
+
+    allocation: PortfolioAllocation
+    quantities: pd.Series
+    valuations: pd.DataFrame
+    weights: pd.DataFrame
+    remaining_maturities: pd.DataFrame
+    windows: pd.DataFrame
+    records: pd.DataFrame
+    statistics: pd.DataFrame
+    latest_scenarios: Mapping[str, pd.DataFrame]
+    latest_losses: Mapping[str, pd.DataFrame]
+    diversification: pd.DataFrame
+    attribution: VaRAttribution
 
 
 def _as_date(value: object, label: str) -> pd.Timestamp:
@@ -824,6 +877,343 @@ def run_terminal_analysis(
         calibration, allocation, market.levels, path_count=path_count, master_seed=master_seed
     )
     return TerminalAnalysis(calibration, standalone, correlated)
+
+
+def _integer_count(value: int, label: str, minimum: int = 1) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
+        raise DataValidationError(f"{label} must be an integer >= {minimum}")
+    return int(value)
+
+
+def rolling_forecast_seed(forecast_ordinal: int, master_seed: int = MASTER_SEED) -> int:
+    """Key each forecast to its global eligible ordinal, independent of call order.
+
+    Ordinal zero is the forecast immediately following the first 500 changes;
+    later selection of the latest 250 forecasts does not renumber these streams.
+    """
+    ordinal = _integer_count(forecast_ordinal, "forecast_ordinal", minimum=0)
+    parent = create_child_seeds(master_seed)["rolling_parametric_var"]
+    child = np.random.SeedSequence(parent, spawn_key=(ordinal,))
+    return int(child.generate_state(1, dtype=np.uint64)[0])
+
+
+def create_forecast_rng(forecast_ordinal: int, master_seed: int = MASTER_SEED) -> np.random.Generator:
+    """A fresh one-day Gaussian scenario generator for a particular forecast."""
+    return np.random.default_rng(rolling_forecast_seed(forecast_ordinal, master_seed))
+
+
+def _binary_sequence(exceptions: object) -> np.ndarray:
+    values = np.asarray(exceptions)
+    if (values.ndim != 1 or not values.size or values.dtype.kind not in "biuf"
+            or not np.isfinite(values).all() or not np.isin(values, [0, 1]).all()):
+        raise DataValidationError("Exceptions must be a nonempty one-dimensional binary sequence")
+    return values.astype(int)
+
+
+def _bernoulli_loglik(zeros: int, ones: int, probability: float) -> float:
+    # xlogy/xlog1py implement the continuous boundary convention 0 * log(0) = 0.
+    return float(xlogy(ones, probability) + xlog1py(zeros, -probability))
+
+
+def kupiec_test(exceptions: object) -> dict[str, float | int]:
+    """Unconditional coverage LR using all forecasts and nominal exception rate 1%.
+
+    Log likelihoods use xlogy/xlog1py, so all-zero/all-one samples remain finite.
+    P-values use chi-square survival functions (one degree of freedom), avoiding
+    subtraction of a CDF near one. These are asymptotic, including at boundaries.
+    """
+    sequence = _binary_sequence(exceptions)
+    n, hits = len(sequence), int(sequence.sum())
+    null = _bernoulli_loglik(n - hits, hits, 1.0 - VAR_CONFIDENCE)
+    alternative = _bernoulli_loglik(n - hits, hits, hits / n)
+    lr = max(0.0, 2.0 * (alternative - null))  # LR cannot be negative; remove roundoff.
+    return {"forecasts": n, "exception_count": hits, "exception_rate": hits / n,
+            "kupiec_lr": lr, "kupiec_p_value": float(chi2.sf(lr, 1))}
+
+
+def christoffersen_test(exceptions: object) -> dict[str, float | int | bool]:
+    """First-order independence and LRcc = LRuc + LRind (df 1 and 2).
+
+    Independence conditions on the first observation: transition likelihoods use
+    T-1 transitions, with a pooled transition MLE under independence. A transition
+    row never visited contributes zero log likelihood; its unidentified probability
+    is NaN. Boundary probabilities use 0*log(0)=0 without smoothing/pseudocounts.
+    An all-zero or all-one sequence thus has LRind=0. Standard asymptotic p-values
+    are retained, with independence_identified=False when a row is unobserved.
+    For a singleton there are no transitions: independence/CC statistics and their
+    p-values are NaN. UC still uses all T observations. No observation is invented.
+    Christoffersen (1998), Evaluating Interval Forecasts, doi:10.2307/2527341.
+    """
+    sequence = _binary_sequence(exceptions)
+    counts = np.bincount(2 * sequence[:-1] + sequence[1:], minlength=4)
+    n00, n01, n10, n11 = (int(count) for count in counts)
+    p01 = n01 / (n00 + n01) if n00 + n01 else np.nan
+    p11 = n11 / (n10 + n11) if n10 + n11 else np.nan
+    lr_ind = lr_cc = p_ind = p_cc = np.nan
+    if len(sequence) > 1:
+        pooled = (n01 + n11) / (len(sequence) - 1)
+        null = _bernoulli_loglik(n00 + n10, n01 + n11, pooled)
+        alternative = 0.0
+        if n00 + n01:
+            alternative += _bernoulli_loglik(n00, n01, p01)
+        if n10 + n11:
+            alternative += _bernoulli_loglik(n10, n11, p11)
+        lr_ind = max(0.0, 2.0 * (alternative - null))
+        lr_cc = float(kupiec_test(sequence)["kupiec_lr"]) + lr_ind
+        p_ind, p_cc = float(chi2.sf(lr_ind, 1)), float(chi2.sf(lr_cc, 2))
+    return {"n00": n00, "n01": n01, "n10": n10, "n11": n11,
+            "p01": p01, "p11": p11, "independence_identified": bool(n00 + n01 and n10 + n11),
+            "christoffersen_ind_lr": lr_ind, "christoffersen_ind_p_value": p_ind,
+            "christoffersen_cc_lr": lr_cc, "christoffersen_cc_p_value": p_cc}
+
+
+def loss_var(losses: pd.DataFrame) -> pd.Series:
+    """99% dollar loss quantiles, using linear empirical quantile interpolation.
+
+    Loss = origin value - next-day value = -P&L. VaR is signed and is not floored
+    at zero: a sufficiently profitable distribution can have negative loss VaR.
+    """
+    if not isinstance(losses, pd.DataFrame) or losses.empty or losses.columns.has_duplicates:
+        raise DataValidationError("Loss scenarios require a nonempty DataFrame with unique columns")
+    values = _real_array(losses.to_numpy(), "losses")
+    quantiles = np.quantile(values, VAR_CONFIDENCE, axis=0, method=VAR_QUANTILE_METHOD)
+    return pd.Series(quantiles, index=losses.columns, name="forecast_var")
+
+
+def diversification_effect(allocated_vars: pd.DataFrame) -> pd.DataFrame:
+    """Sum already-allocated holding dollar VaRs less portfolio VaR; no extra weights."""
+    if not set(RISK_IDENTIFIERS).issubset(allocated_vars.columns):
+        raise DataValidationError("Diversification requires all holdings and portfolio VaR")
+    values = _real_array(allocated_vars.loc[:, list(RISK_IDENTIFIERS)].to_numpy(), "VaRs")
+    standalone_sum = values[:, :len(HOLDINGS)].sum(axis=1)
+    return pd.DataFrame({"allocated_standalone_var_sum": standalone_sum,
+                         "portfolio_var": values[:, -1],
+                         "diversification_effect": standalone_sum - values[:, -1]},
+                        index=allocated_vars.index)
+
+
+def euler_var_attribution(
+    holding_losses: pd.DataFrame, quantities: pd.Series,
+    relative_step: float = ATTRIBUTION_RELATIVE_STEP,
+) -> VaRAttribution:
+    """Euler contributions q_i*dVaR/dq_i from central proportional position bumps.
+
+    Reuse the latest parametric holding losses and the SAME scenarios and quantile
+    rule for all bumps. Full-revaluation losses are linear in fixed position size,
+    so bumping q_i by +/- h*q_i changes each portfolio loss by +/- h*L_i exactly.
+    The default h=1e-4 is documented, fixed, and uses no new random draws. A finite
+    empirical quantile can switch order statistics across bumps; disclose the
+    portfolio VaR, contribution sum, and residual without normalizing contributions.
+    """
+    if not set(HOLDINGS).issubset(holding_losses.columns) or not quantities.index.is_unique:
+        raise DataValidationError("Attribution requires the five holding losses and quantities")
+    losses = _real_array(holding_losses.loc[:, list(HOLDINGS)].to_numpy(), "holding losses")
+    positions = _real_array(quantities.reindex(HOLDINGS).to_numpy(), "quantities")
+    step = _real_array(relative_step, "relative_step")
+    if not len(losses) or (positions <= 0).any() or step.ndim != 0 or not 0 < step < 1:
+        raise DataValidationError("Attribution requires nonempty losses, positive quantities, and 0 < step < 1")
+    total = losses.sum(axis=1)
+    portfolio_var = float(np.quantile(total, VAR_CONFIDENCE, method=VAR_QUANTILE_METHOD))
+    rows = []
+    for column, holding in enumerate(HOLDINGS):
+        bump = float(step) * positions[column]
+        plus = float(np.quantile(total + float(step) * losses[:, column], VAR_CONFIDENCE,
+                                 method=VAR_QUANTILE_METHOD))
+        minus = float(np.quantile(total - float(step) * losses[:, column], VAR_CONFIDENCE,
+                                  method=VAR_QUANTILE_METHOD))
+        marginal = (plus - minus) / (2 * bump)
+        rows.append({"holding": holding, "quantity": positions[column], "quantity_bump": bump,
+                     "var_plus": plus, "var_minus": minus,
+                     "marginal_var_per_unit": marginal,
+                     "euler_contribution": positions[column] * marginal})
+    contributions = pd.DataFrame(rows).set_index("holding")
+    contribution_sum = float(contributions["euler_contribution"].sum())
+    return VaRAttribution(contributions, portfolio_var, contribution_sum,
+                          portfolio_var - contribution_sum, float(step))
+
+
+def scenario_holding_values(
+    allocation: PortfolioAllocation, levels: pd.DataFrame, forecast_origin: object,
+    factor_changes: pd.DataFrame, remaining_maturities: Sequence[float],
+) -> pd.DataFrame:
+    """Full next-day revaluation at supplied exact remaining maturities.
+
+    All eight shocks are applied to origin levels, with vectorized linear yield
+    interpolation between the bracketing fitted tenors. ETF shocks are log returns
+    applied to origin Adj Close, retaining the initial Close-based share quantity.
+    This function never reads a realized forecast-day level.
+    """
+    _, row = _valuation_row(levels, forecast_origin)
+    if (not isinstance(factor_changes, pd.DataFrame) or factor_changes.empty
+            or factor_changes.columns.has_duplicates or set(factor_changes.columns) != set(RISK_FACTOR_COLUMNS)):
+        raise DataValidationError("Scenarios require the eight specified risk factors")
+    shocks = _real_array(factor_changes.loc[:, list(RISK_FACTOR_COLUMNS)].to_numpy(), "factor changes")
+    maturities = _real_array(remaining_maturities, "remaining maturities")
+    if maturities.shape != (3,) or (maturities < TREASURY_TENORS[0]).any() or (maturities > TREASURY_TENORS[-1]).any():
+        raise DataValidationError("Three remaining maturities must stay within fitted coverage [1, 10]")
+    curves = row.loc[list(YIELD_COLUMNS)].to_numpy() + shocks[:, :len(YIELD_COLUMNS)]
+    fitted = np.empty((len(shocks), len(TREASURY_HOLDINGS)))
+    for column, maturity in enumerate(maturities):
+        upper = int(np.searchsorted(TREASURY_TENORS, maturity))
+        if TREASURY_TENORS[upper] == maturity:
+            fitted[:, column] = curves[:, upper]
+        else:
+            lower = upper - 1
+            weight = (maturity - TREASURY_TENORS[lower]) / (TREASURY_TENORS[upper] - TREASURY_TENORS[lower])
+            fitted[:, column] = curves[:, lower] * (1 - weight) + curves[:, upper] * weight
+    bonds = zero_coupon_price(fitted, maturities) * allocation.treasury_face_quantities.to_numpy()
+    origin_adjusted = np.array([row[f"{ticker}_Adj Close"] for ticker in ETF_TICKERS])
+    try:
+        with np.errstate(over="raise", under="raise", invalid="raise", divide="raise"):
+            adjusted = origin_adjusted * np.exp(shocks[:, len(YIELD_COLUMNS):])
+            etfs = (allocation.etf_shares.to_numpy() * allocation.initial_etf_close.to_numpy()
+                    * (adjusted / allocation.initial_etf_adj_close.to_numpy()))
+    except FloatingPointError as exc:
+        raise DataValidationError("One-day ETF scenario values are not representable") from exc
+    values = np.column_stack([bonds, etfs])
+    if not np.isfinite(values).all() or (values <= 0).any():
+        raise DataValidationError("One-day holding values must be finite and positive")
+    return pd.DataFrame(values, index=factor_changes.index, columns=HOLDINGS)
+
+
+def _backtest_inputs(market: MarketData) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Check chronological alignment, including the explicit start date of each change."""
+    for frame in (market.levels, market.yield_changes, market.etf_log_returns):
+        if (not isinstance(frame.index, pd.DatetimeIndex) or frame.index.hasnans
+                or frame.index.has_duplicates or not frame.index.is_monotonic_increasing):
+            raise DataValidationError("Backtest inputs require unique chronological daily dates")
+    if not market.yield_changes.index.equals(market.etf_log_returns.index):
+        raise DataValidationError("Backtest yield and ETF change indices must match")
+    price_columns = [f"{ticker}_{field}" for ticker in ETF_TICKERS for field in ETF_PRICE_FIELDS]
+    levels, _ = validate_source_frame(market.levels, LEVEL_COLUMNS, "backtest levels",
+                                       price_columns=price_columns)
+    changes, _ = validate_source_frame(market.risk_factor_changes, RISK_FACTOR_COLUMNS, "backtest changes")
+    if not changes.index.equals(levels.index[1:]):
+        raise DataValidationError("Each backtest change must end at the next aligned level date")
+    if (market.change_start_dates.index.has_duplicates
+            or not market.change_start_dates.index.is_monotonic_increasing):
+        raise DataValidationError("Change-start metadata must have unique chronological dates")
+    starts = market.change_start_dates.reindex(changes.index)
+    if starts.isna().any() or not pd.DatetimeIndex(starts.to_numpy()).equals(levels.index[:-1]):
+        raise DataValidationError("Each change must start at the immediately preceding aligned date")
+    if not np.isfinite(levels.to_numpy()).all() or not np.isfinite(changes.to_numpy()).all():
+        raise DataValidationError("Backtest levels and changes must be finite and complete")
+    return levels, changes
+
+
+def estimation_window(
+    changes: pd.DataFrame, forecast_change_position: int, forecast_origin: object,
+    forecast_date: object,
+) -> pd.DataFrame:
+    """Exactly 500 immediately preceding changes, with explicit no-look-ahead checks."""
+    position = _integer_count(forecast_change_position, "forecast_change_position", CALIBRATION_WINDOW)
+    origin, target = _as_date(forecast_origin, "forecast_origin"), _as_date(forecast_date, "forecast_date")
+    if changes.index.has_duplicates or not changes.index.is_monotonic_increasing or position >= len(changes):
+        raise DataValidationError("Invalid chronological forecast-change index")
+    window = changes.iloc[position - CALIBRATION_WINDOW:position].copy()
+    if (len(window) != CALIBRATION_WINDOW or changes.index[position] != target
+            or window.index[-1] != origin or origin >= target
+            or not (window.index < target).all() or target in window.index):
+        raise DataValidationError("Estimation window violates the forecast origin or no-look-ahead boundary")
+    return window
+
+
+def backtest_var(
+    market: MarketData, *, scenario_count: int = SIMULATION_PATHS,
+    forecast_count: int = BACKTEST_FORECASTS, master_seed: int = MASTER_SEED,
+) -> BacktestResult:
+    """Latest 250 eligible one-day forecasts; smaller counts support offline checks.
+
+    Allocate USD 1m at the first selected forecast origin, then hold all quantities
+    fixed. Backtest ages are aligned steps/252 for origin, scenarios, and realized
+    observations alike, rather than the standalone historical ACT/365 default.
+    Each Gaussian uses precisely the immediately preceding 500 eight-factor
+    changes. Historical scenarios apply those same 500 changes to current levels.
+    Exceptions are strict: realized P&L < -VaR. Dollar loss VaRs are not clipped.
+    Only the latest scenario distributions are retained for diversification and
+    common-scenario Euler attribution; no files or publication outputs are written.
+    """
+    scenario_count = _integer_count(scenario_count, "scenario_count")
+    forecast_count = _integer_count(forecast_count, "forecast_count")
+    if forecast_count > BACKTEST_FORECASTS:
+        raise DataValidationError(f"At most {BACKTEST_FORECASTS} forecasts are in scope")
+    levels, changes = _backtest_inputs(market)
+    if len(changes) < CALIBRATION_WINDOW + forecast_count:
+        raise DataValidationError(
+            f"Backtest requires {CALIBRATION_WINDOW + forecast_count} aligned changes; found {len(changes)}"
+        )
+    first = len(changes) - forecast_count
+    allocation = allocate_portfolio(levels, levels.index[first])
+    quantities = pd.concat([allocation.treasury_face_quantities, allocation.etf_shares]).reindex(HOLDINGS)
+    dates = levels.index[first:]
+    ages = np.arange(forecast_count + 1) / TRADING_DAYS
+    remaining = pd.DataFrame(np.asarray(INITIAL_MATURITIES) - ages[:, None],
+                             index=dates, columns=TREASURY_HOLDINGS)
+    valuations = pd.DataFrame([
+        holding_values(allocation, levels, stamp, elapsed_years=float(age))
+        for stamp, age in zip(dates, ages)
+    ], index=dates).reindex(columns=HOLDINGS)
+    weights = valuations.div(valuations.sum(axis=1), axis=0)
+    records, window_rows = [], []
+    latest_scenarios, latest_losses, latest_vars = {}, {}, {}
+    for step, position in enumerate(range(first, len(changes))):
+        origin, forecast_date = levels.index[position], changes.index[position]
+        window = estimation_window(changes, position, origin, forecast_date)
+        model = calibrate_gaussian(window, origin)
+        if not model.sample.index.equals(window.index):
+            raise DataValidationError("Rolling calibration changed the checked estimation window")
+        ordinal = position - CALIBRATION_WINDOW
+        generator = create_forecast_rng(ordinal, master_seed)
+        simulated = generator.standard_normal((scenario_count, len(RISK_FACTOR_COLUMNS)))
+        simulated = simulated @ model.covariance_adjustment.factor.T + model.mean.to_numpy()
+        scenarios = {
+            "parametric": pd.DataFrame(simulated, columns=RISK_FACTOR_COLUMNS,
+                                        index=pd.RangeIndex(1, scenario_count + 1, name="scenario")),
+            "historical": window,
+        }
+        current = valuations.iloc[step]
+        realized = valuations.iloc[step + 1] - current
+        realized["Portfolio"] = realized.sum()
+        for method, factor_changes in scenarios.items():
+            future = scenario_holding_values(allocation, levels, origin, factor_changes, remaining.iloc[step + 1])
+            losses = future.rsub(current, axis=1)
+            losses["Portfolio"] = losses.sum(axis=1)
+            forecasts = loss_var(losses)
+            for holding in RISK_IDENTIFIERS:
+                var, pnl = float(forecasts[holding]), float(realized[holding])
+                records.append({"forecast_date": forecast_date, "method": method, "holding": holding,
+                                "forecast_var": var, "realized_pnl": pnl, "exception": pnl < -var,
+                                "estimation_window_start": window.index[0],
+                                "estimation_window_end": window.index[-1], "forecast_origin": origin,
+                                "forecast_ordinal": ordinal})
+            if step == forecast_count - 1:
+                latest_scenarios[method] = factor_changes.copy()
+                latest_losses[method] = losses
+                latest_vars[method] = forecasts
+        correction = model.covariance_adjustment
+        window_rows.append({"forecast_date": forecast_date, "forecast_origin": origin,
+                            "forecast_change_position": position, "forecast_ordinal": ordinal,
+                            "estimation_count": len(window),
+                            "estimation_window_start": window.index[0], "estimation_window_end": window.index[-1],
+                            "parametric_seed": rolling_forecast_seed(ordinal, master_seed),
+                            "covariance_clipped_eigenvalues": correction.clipped_eigenvalues,
+                            "covariance_correction_frobenius_norm": correction.correction_frobenius_norm})
+    record_frame = pd.DataFrame(records)
+    statistics = []
+    for (method, holding), group in record_frame.groupby(["method", "holding"], sort=False):
+        exceptions = group.sort_values("forecast_date")["exception"].to_numpy()
+        statistics.append({"method": method, "holding": holding,
+                           **kupiec_test(exceptions), **christoffersen_test(exceptions)})
+    stats = pd.DataFrame(statistics).set_index(["method", "holding"])
+    diversification = diversification_effect(pd.DataFrame.from_dict(latest_vars, orient="index"))
+    diversification.index.name = "method"
+    diversification["forecast_date"] = dates[-1]
+    diversification["forecast_origin"] = dates[-2]
+    attribution = euler_var_attribution(latest_losses["parametric"], quantities)
+    return BacktestResult(allocation, quantities, valuations, weights, remaining,
+                          pd.DataFrame(window_rows).set_index("forecast_date"), record_frame, stats,
+                          MappingProxyType(latest_scenarios), MappingProxyType(latest_losses),
+                          diversification, attribution)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

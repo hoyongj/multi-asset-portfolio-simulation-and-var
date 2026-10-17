@@ -8,6 +8,7 @@ import io
 import math
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -37,15 +38,15 @@ def synthetic_sources():
     return yields, etfs
 
 
-def synthetic_terminal_market():
+def synthetic_terminal_market(observations=530):
     """A non-flat curve and correlated factors, with more than 500 valid changes."""
-    dates = pd.bdate_range(end=pv.ANALYSIS_END, periods=530, name="Date").as_unit("ns")
+    dates = pd.bdate_range(end=pv.ANALYSIS_END, periods=observations, name="Date").as_unit("ns")
     rng = np.random.default_rng(731)
     mixing = np.eye(8)
     mixing[1:6, 0] = .7
     mixing[6, 0], mixing[7, 6] = -.4, .5
     scales = np.array([.00015] * 6 + [.006, .009])
-    changes = (rng.standard_normal((529, 8)) @ mixing.T) * scales
+    changes = (rng.standard_normal((observations - 1, 8)) @ mixing.T) * scales
     cumulative = np.vstack([np.zeros(8), changes.cumsum(axis=0)])
     yields = pd.DataFrame(
         (np.array([.025, .03, .035, .04, .045, .05]) + cumulative[:, :6]) * 100,
@@ -677,6 +678,257 @@ class TerminalSimulationTests(unittest.TestCase):
         self.assertIn("500 aligned changes", output.getvalue())
         self.assertIn("correlated_terminal_simulation: 4 paths, 252 trading days", output.getvalue())
         self.assertIn("Covariance correction:", output.getvalue())
+
+
+class CoverageStatisticsTests(unittest.TestCase):
+    def test_known_sequence_and_transition_counts(self):
+        sequence = [0, 0, 1, 0, 1, 1, 0, 0]
+        kupiec = pv.kupiec_test(sequence)
+        christoffersen = pv.christoffersen_test(sequence)
+        self.assertEqual(kupiec["exception_count"], 3)
+        self.assertEqual(kupiec["exception_rate"], 3 / 8)
+        self.assertAlmostEqual(kupiec["kupiec_lr"], 17.146512663935848)
+        self.assertAlmostEqual(christoffersen["christoffersen_ind_lr"], .1964510115581639)
+        self.assertAlmostEqual(christoffersen["christoffersen_cc_lr"], 17.342963675494012)
+        self.assertEqual([christoffersen[key] for key in ("n00", "n01", "n10", "n11")], [2, 2, 2, 1])
+        self.assertEqual(christoffersen["p01"], .5)
+        self.assertEqual(christoffersen["p11"], 1 / 3)
+        self.assertAlmostEqual(kupiec["kupiec_p_value"], math.erfc(math.sqrt(kupiec["kupiec_lr"] / 2)))
+        self.assertAlmostEqual(christoffersen["christoffersen_ind_p_value"],
+                               math.erfc(math.sqrt(christoffersen["christoffersen_ind_lr"] / 2)))
+        self.assertAlmostEqual(christoffersen["christoffersen_cc_p_value"],
+                               math.exp(-christoffersen["christoffersen_cc_lr"] / 2))
+
+    def test_zero_and_all_exceptions_use_boundary_likelihoods(self):
+        for value in (0, 1):
+            sequence = np.full(250, value)
+            kupiec = pv.kupiec_test(sequence)
+            christoffersen = pv.christoffersen_test(sequence)
+            expected_lr = -2 * 250 * math.log(.01 if value else .99)
+            self.assertAlmostEqual(kupiec["kupiec_lr"], expected_lr)
+            self.assertTrue(np.isfinite(kupiec["kupiec_p_value"]))
+            self.assertEqual(christoffersen["christoffersen_ind_lr"], 0.)
+            self.assertEqual(christoffersen["christoffersen_ind_p_value"], 1.)
+            self.assertAlmostEqual(christoffersen["christoffersen_cc_lr"], expected_lr)
+            self.assertFalse(christoffersen["independence_identified"])
+            self.assertTrue(math.isnan(christoffersen["p01" if value else "p11"]))
+
+    def test_alternating_boundary_probabilities_and_singleton(self):
+        result = pv.christoffersen_test([0, 1] * 5)
+        self.assertEqual((result["n00"], result["n11"]), (0, 0))
+        self.assertEqual((result["p01"], result["p11"]), (1., 0.))
+        self.assertGreater(result["christoffersen_ind_lr"], 0.)
+        self.assertTrue(np.isfinite(result["christoffersen_cc_p_value"]))
+        singleton = pv.christoffersen_test([0])
+        self.assertTrue(math.isnan(singleton["christoffersen_ind_lr"]))
+        self.assertTrue(math.isnan(singleton["christoffersen_cc_p_value"]))
+        self.assertTrue(np.isfinite(pv.kupiec_test([0])["kupiec_lr"]))
+
+    def test_invalid_exception_sequences_fail(self):
+        for sequence in ([], [0, 2], [np.nan], [[0, 1]], ["0", "1"]):
+            for function in (pv.kupiec_test, pv.christoffersen_test):
+                with self.subTest(sequence=sequence), self.assertRaises(pv.DataValidationError):
+                    function(sequence)
+
+
+class OneDayRiskTests(unittest.TestCase):
+    def test_loss_var_sign_and_linear_quantile_convention(self):
+        result = pv.loss_var(pd.DataFrame({"loss": [-3., 1., 5.], "gain": [-5., -3., -1.]}))
+        self.assertAlmostEqual(result["loss"], 4.92)
+        self.assertAlmostEqual(result["gain"], -1.04)
+        with self.assertRaises(pv.DataValidationError):
+            pv.loss_var(pd.DataFrame({"loss": [np.nan]}))
+
+    def test_vectorized_scenarios_use_exact_maturity_and_full_prices(self):
+        market = synthetic_terminal_market()
+        origin = market.levels.index[-1]
+        allocation = pv.allocate_portfolio(market.levels, origin)
+        shocks = pd.DataFrame([
+            np.zeros(8), [.001, -.002, .003, -.004, .005, -.006, .02, -.03]
+        ], columns=pv.RISK_FACTOR_COLUMNS)
+        for age in (.5, 250 / 252):
+            maturities = np.asarray(pv.INITIAL_MATURITIES) - age
+            values = pv.scenario_holding_values(allocation, market.levels, origin, shocks, maturities)
+            row = market.levels.loc[origin]
+            for scenario in range(len(shocks)):
+                curve = {tenor: row[column] + shocks.loc[scenario, column]
+                         for tenor, column in zip(pv.TREASURY_TENORS, pv.YIELD_COLUMNS)}
+                for holding, maturity in zip(pv.TREASURY_HOLDINGS, maturities):
+                    expected = allocation.treasury_face_quantities[holding] * math.exp(
+                        -pv.interpolate_yield(curve, maturity) * maturity)
+                    self.assertAlmostEqual(values.loc[scenario, holding], expected)
+                for ticker in pv.ETF_TICKERS:
+                    expected = allocation.initial_holding_values[ticker] * math.exp(shocks.loc[scenario, ticker])
+                    self.assertAlmostEqual(values.loc[scenario, ticker], expected)
+
+    def test_forecast_streams_do_not_depend_on_execution_order(self):
+        ordinals = [0, 3, 249, 493]
+        first = {ordinal: pv.create_forecast_rng(ordinal).normal(size=(8, 8)) for ordinal in ordinals}
+        for ordinal in reversed(ordinals):
+            np.testing.assert_array_equal(first[ordinal], pv.create_forecast_rng(ordinal).normal(size=(8, 8)))
+        self.assertEqual(len({pv.rolling_forecast_seed(i) for i in ordinals}), len(ordinals))
+        self.assertFalse(np.array_equal(first[3], pv.create_forecast_rng(3, 43).normal(size=(8, 8))))
+        for ordinal in (-1, True, 1.5):
+            with self.assertRaises(pv.DataValidationError):
+                pv.create_forecast_rng(ordinal)
+
+    def test_diversification_uses_already_allocated_dollar_vars(self):
+        allocated = pd.DataFrame([[100., 200., 300., 400., 500., 1_000.],
+                                  [10., 20., 30., 40., 50., 120.]],
+                                 index=pv.VAR_METHODS, columns=pv.RISK_IDENTIFIERS)
+        result = pv.diversification_effect(allocated)
+        np.testing.assert_allclose(result["allocated_standalone_var_sum"], [1_500., 150.])
+        np.testing.assert_allclose(result["diversification_effect"], [500., 30.])
+
+    def test_euler_contributions_and_disclosed_rank_switch_residual(self):
+        quantities = pd.Series([10., 20., 30., 40., 50.], index=pv.HOLDINGS)
+        common = pd.DataFrame(np.arange(100)[:, None] * np.arange(1, 6)[None, :], columns=pv.HOLDINGS)
+        result = pv.euler_var_attribution(common, quantities)
+        self.assertEqual(tuple(result.contributions.index), pv.HOLDINGS)
+        np.testing.assert_allclose(result.contributions["euler_contribution"], 98.01 * np.arange(1, 6), atol=1e-7)
+        self.assertAlmostEqual(result.contribution_sum + result.residual, result.portfolio_var)
+        crossing = pd.DataFrame([[10., 0., 0., 0., 0.], [0., 10.0001, 0., 0., 0.]], columns=pv.HOLDINGS)
+        result = pv.euler_var_attribution(crossing, quantities)
+        self.assertEqual(len(result.contributions), 5)
+        self.assertGreater(abs(result.residual), 1e-7)
+        self.assertAlmostEqual(result.contribution_sum, result.contributions["euler_contribution"].sum())
+        self.assertAlmostEqual(result.residual, result.portfolio_var - result.contribution_sum)
+        self.assertAlmostEqual(result.relative_step, 1e-4)
+
+
+class RollingBacktestTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.market = synthetic_terminal_market(observations=751)
+        cls.result = pv.backtest_var(cls.market, scenario_count=16)
+
+    def test_exactly_250_forecasts_and_500_immediate_changes(self):
+        result = self.result
+        self.assertEqual(len(self.market.risk_factor_changes), 750)
+        self.assertEqual(len(result.windows), 250)
+        self.assertEqual(len(result.records), 250 * 2 * 6)
+        self.assertEqual(result.allocation.allocation_date, self.market.levels.index[500])
+        for target, metadata in result.windows.iterrows():
+            position = int(metadata["forecast_change_position"])
+            window = pv.estimation_window(self.market.risk_factor_changes, position,
+                                           metadata["forecast_origin"], target)
+            self.assertEqual(len(window), 500)
+            self.assertEqual(window.index[0], metadata["estimation_window_start"])
+            self.assertEqual(window.index[-1], metadata["estimation_window_end"])
+            self.assertEqual(window.index[-1], metadata["forecast_origin"])
+            self.assertTrue((window.index < target).all())
+            self.assertNotIn(target, window.index)
+        self.assertEqual(tuple(result.latest_scenarios["parametric"].columns), pv.RISK_FACTOR_COLUMNS)
+        self.assertEqual(result.latest_scenarios["historical"].shape, (500, 8))
+
+    def test_fixed_quantities_weight_drift_and_exact_aging(self):
+        result = self.result
+        np.testing.assert_allclose(result.weights.iloc[0], pv.WEIGHTS)
+        self.assertFalse(np.allclose(result.weights.iloc[-1], pv.WEIGHTS))
+        self.assertAlmostEqual(result.valuations.iloc[0].sum(), 1_000_000.)
+        expected_quantities = pd.concat([result.allocation.treasury_face_quantities,
+                                         result.allocation.etf_shares]).reindex(pv.HOLDINGS)
+        assert_series_equal(result.quantities, expected_quantities)
+        for step in (0, 1, 125, 250):
+            stamp = result.valuations.index[step]
+            row = self.market.levels.loc[stamp]
+            for holding, initial_maturity in zip(pv.TREASURY_HOLDINGS, pv.INITIAL_MATURITIES):
+                maturity = initial_maturity - step / 252
+                self.assertEqual(result.remaining_maturities.loc[stamp, holding], maturity)
+                curve = dict(zip(pv.TREASURY_TENORS, row[list(pv.YIELD_COLUMNS)]))
+                expected = result.quantities[holding] * math.exp(-pv.interpolate_yield(curve, maturity) * maturity)
+                self.assertAlmostEqual(result.valuations.loc[stamp, holding], expected)
+            for ticker in pv.ETF_TICKERS:
+                expected = (result.allocation.etf_shares[ticker] * result.allocation.initial_etf_close[ticker]
+                            * row[f"{ticker}_Adj Close"] / result.allocation.initial_etf_adj_close[ticker])
+                self.assertAlmostEqual(result.valuations.loc[stamp, ticker], expected)
+
+    def test_realized_pnl_exceptions_and_coverage_counts(self):
+        result = self.result
+        for target in result.windows.index[[0, 124, -1]]:
+            origin = result.windows.loc[target, "forecast_origin"]
+            pnl = result.valuations.loc[target] - result.valuations.loc[origin]
+            pnl["Portfolio"] = pnl.sum()
+            for row in result.records.loc[result.records["forecast_date"] == target].itertuples():
+                self.assertAlmostEqual(row.realized_pnl, pnl[row.holding])
+        np.testing.assert_array_equal(result.records["exception"],
+                                       result.records["realized_pnl"] < -result.records["forecast_var"])
+        for key, group in result.records.groupby(["method", "holding"]):
+            stats = result.statistics.loc[key]
+            self.assertEqual(stats["forecasts"], 250)
+            self.assertEqual(stats["exception_count"], group["exception"].sum())
+            self.assertEqual(stats["exception_rate"], group["exception"].mean())
+            self.assertEqual(sum(stats[name] for name in ("n00", "n01", "n10", "n11")), 249)
+
+    def test_latest_diversification_and_attribution_reconcile_without_extra_weights(self):
+        result = self.result
+        for method in pv.VAR_METHODS:
+            latest = result.records.loc[(result.records["forecast_date"] == result.windows.index[-1])
+                                         & (result.records["method"] == method)].set_index("holding")
+            expected = latest.loc[list(pv.HOLDINGS), "forecast_var"].sum() - latest.loc["Portfolio", "forecast_var"]
+            self.assertAlmostEqual(result.diversification.loc[method, "diversification_effect"], expected)
+            assert_series_equal(pv.loss_var(result.latest_losses[method]), latest["forecast_var"].reindex(pv.RISK_IDENTIFIERS),
+                                check_names=False)
+        attribution = result.attribution
+        self.assertEqual(len(attribution.contributions), 5)
+        self.assertAlmostEqual(attribution.portfolio_var, pv.loss_var(result.latest_losses["parametric"])["Portfolio"])
+        self.assertAlmostEqual(attribution.contribution_sum + attribution.residual, attribution.portfolio_var)
+
+    def test_forecast_change_cannot_enter_estimation_and_metadata_must_align(self):
+        changes = self.market.risk_factor_changes
+        with self.assertRaisesRegex(pv.DataValidationError, "no-look-ahead"):
+            pv.estimation_window(changes, 500, changes.index[500], changes.index[500])
+        shifted = self.market.change_start_dates.shift(1)
+        with self.assertRaisesRegex(pv.DataValidationError, "immediately preceding"):
+            pv.backtest_var(replace(self.market, change_start_dates=shifted), scenario_count=4)
+
+    def test_insufficient_data_and_invalid_counts_fail(self):
+        with self.assertRaisesRegex(pv.DataValidationError, "750"):
+            pv.backtest_var(synthetic_terminal_market(), scenario_count=4)
+        for kwargs in ({"scenario_count": 0}, {"scenario_count": True},
+                       {"forecast_count": 0}, {"forecast_count": 251}):
+            with self.assertRaises(pv.DataValidationError):
+                pv.backtest_var(self.market, **kwargs)
+
+
+class BacktestIndependenceTests(unittest.TestCase):
+    def test_realized_forecast_day_change_does_not_change_any_forecast_var(self):
+        market = synthetic_terminal_market()
+        baseline = pv.backtest_var(market, scenario_count=32, forecast_count=3)
+        changed = market.levels.copy()
+        changed.loc[changed.index[-1], list(pv.YIELD_COLUMNS)] += .02
+        changed.loc[changed.index[-1], ["LQD_Adj Close", "SPY_Adj Close"]] *= .8
+        yields = changed.loc[:, list(pv.YIELD_COLUMNS)] * 100
+        etfs = {ticker: changed.loc[:, [f"{ticker}_Close", f"{ticker}_Adj Close"]].set_axis(pv.ETF_PRICE_FIELDS, axis=1)
+                for ticker in pv.ETF_TICKERS}
+        modified = pv.backtest_var(pv.prepare_market_data(yields, etfs), scenario_count=32, forecast_count=3)
+        assert_series_equal(baseline.records["forecast_var"], modified.records["forecast_var"])
+        self.assertFalse(baseline.records["realized_pnl"].equals(modified.records["realized_pnl"]))
+
+    def test_repeated_backtests_and_selected_subsets_have_deterministic_scenarios(self):
+        market = synthetic_terminal_market()
+        first = pv.backtest_var(market, scenario_count=32, forecast_count=3)
+        repeated = pv.backtest_var(market, scenario_count=32, forecast_count=3)
+        assert_frame_equal(first.records, repeated.records)
+        assert_frame_equal(first.attribution.contributions, repeated.attribution.contributions)
+        subset = pv.backtest_var(market, scenario_count=32, forecast_count=1)
+        assert_frame_equal(first.latest_scenarios["parametric"], subset.latest_scenarios["parametric"])
+        self.assertEqual(first.windows.index[-1], market.levels.index[-1])
+
+    def test_zero_losses_have_zero_var_no_exceptions_and_carry_has_negative_loss_var(self):
+        dates = pd.bdate_range(end=pv.ANALYSIS_END, periods=504)
+        etfs = {ticker: pd.DataFrame({"Close": 100., "Adj Close": 80.}, index=dates) for ticker in pv.ETF_TICKERS}
+        for yield_percent in (0., 3.):
+            yields = pd.DataFrame(yield_percent, index=dates, columns=pv.YIELD_COLUMNS)
+            result = pv.backtest_var(pv.prepare_market_data(yields, etfs), scenario_count=8, forecast_count=3)
+            if yield_percent == 0:
+                np.testing.assert_array_equal(result.records["forecast_var"], 0.)
+                np.testing.assert_array_equal(result.records["realized_pnl"], 0.)
+                self.assertFalse(result.records["exception"].any())
+            else:
+                bonds = result.records.loc[result.records["holding"].isin(pv.TREASURY_HOLDINGS)]
+                self.assertTrue((bonds["forecast_var"] < 0).all())
+                self.assertTrue((bonds["realized_pnl"] > 0).all())
 
 
 if __name__ == "__main__":
