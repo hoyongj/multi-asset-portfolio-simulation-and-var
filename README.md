@@ -12,6 +12,40 @@ This local Python project studies one-year terminal outcomes and one-day market-
 
 USD 1,000,000 is the initial reporting notional: USD 100,000 in each Treasury, USD 300,000 in LQD, and USD 400,000 in SPY. Dollar values, P&L, VaR, and contributions scale with this notional. Returns and risk expressed as percentages of portfolio value are invariant to it. Fractional positions are allowed.
 
+## STA2540 group-project analysis (spec-aligned)
+
+The analysis above predates the Lecture 4 group-project brief. [group_project_var.py](group_project_var.py) is a separate, self-contained module that follows that brief exactly; it does not change the original analysis or its `outputs/`.
+
+| Holding | Market value (USD) | Instrument | Priced at |
+| --- | ---: | --- | --- |
+| SPX | 4,000 | S&P 500 index | FRED `SP500` |
+| Govt_10Y | 2,000 | 10-year government bond, 4% semiannual coupon | FRED `DGS10` |
+| Corp_A_10Y | 4,000 | 10-year A-rated bond, 5% semiannual coupon | `DGS10` + FRED `BAA10Y` |
+
+- **Data:** 2019-12-31 through 2020-12-31 (inclusive) from FRED. Only dates on which all three series are observed are kept (252 dates, 251 daily changes); nothing is filled. The valuation date is 2020-12-31.
+- **Risk factors:** SPX daily log return, absolute change in the 10-year Treasury yield, and absolute change in the Baa-Treasury spread.
+- **Pricing:** each bond is a newly issued 10-year bullet discounted at a single yield to maturity with semiannual compounding. Every scenario fully reprices the bonds; there is no duration approximation. Shocks apply instantaneously, so carry and roll-down over the horizon are ignored.
+- **Historical simulation:** 1-day uses all 251 observed daily changes; 5-day uses 247 overlapping 5-day changes.
+- **Monte Carlo:** a multivariate normal fitted to the same daily changes (sample mean and covariance), with 100,000 paths and seed 42. The 5-day horizon sums five IID daily draws, so SPX follows GBM and rates and spreads follow arithmetic Brownian motion.
+- **Measures:** VaR and ES at 95% and 99%, for each holding and the portfolio, plus diversification (sum of standalone VaRs minus portfolio VaR).
+- **Proxy caveat:** `BAA10Y` is a Baa spread, so it overstates the spread level and volatility of an A-rated issuer. The brief specifies it, and it is a conservative choice.
+
+Portfolio results (USD, from [risk_measures.csv](group_project_outputs/risk_measures.csv)):
+
+| Method | Horizon | VaR 95% | ES 95% | VaR 99% | ES 99% |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Historical | 1-day | 111.62 | 232.95 | 355.97 | 420.87 |
+| Monte Carlo | 1-day | 136.16 | 171.52 | 193.84 | 222.33 |
+| Historical | 5-day | 285.49 | 612.04 | 835.10 | 902.36 |
+| Monte Carlo | 5-day | 289.85 | 365.14 | 412.90 | 472.10 |
+
+Historical 99% figures rest on only 2-3 tail observations from the March 2020 COVID shock. The normal Monte Carlo model has thin tails and understates them. Outputs in [group_project_outputs/](group_project_outputs/) are `market_data.csv` (aligned levels), `positions.csv` (prices, quantities, yields, modified duration, DV01), `risk_measures.csv`, and `pnl_distributions.png`.
+
+```bash
+.venv/bin/python -m unittest test_group_project_var -v
+.venv/bin/python group_project_var.py
+```
+
 ## Sources and sample
 
 The requested period is **2022-09-01 through 2026-08-31, inclusive**, subject to source availability. No local market-data inputs are required.
@@ -126,6 +160,15 @@ python -m venv .venv
 .venv\Scripts\python.exe portfolio_var.py
 ```
 
+On macOS/Linux, use the same `.venv` with POSIX paths:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest -v
+.venv/bin/python portfolio_var.py
+```
+
 Environment creation and installation are setup steps; reuse the existing environment for subsequent tests and analyses. The single analysis command performs retrieval, validation, alignment, simulation, rolling forecasts, coverage tests, diversification, attribution, and reporting with the fixed settings. It renders figures in memory, closes them after rendering, and creates `outputs/` only after successful analysis and report preparation. Subsequent successful runs replace the same nine result files. No additional output files are produced.
 
 ## Repository and outputs
@@ -134,6 +177,7 @@ Environment creation and installation are setup steps; reuse the existing enviro
 | --- | --- |
 | [portfolio_var.py](portfolio_var.py) | All configuration and functions for retrieval, validation, pricing, simulation, VaR backtesting, coverage tests, diversification, attribution, and output generation. Run this module to perform the complete analysis. |
 | [test_portfolio_var.py](test_portfolio_var.py) | Consolidated offline `unittest` suite using synthetic data. |
+| [group_project_var.py](group_project_var.py) / [test_group_project_var.py](test_group_project_var.py) | Spec-aligned STA2540 group-project analysis and its offline tests; writes to `group_project_outputs/`. |
 | [outputs/data_quality.csv](outputs/data_quality.csv) | Source coverage, missing and dropped dates, alignment, units, conventions, allocations, seeds, and covariance corrections. |
 | [outputs/terminal_paths.csv](outputs/terminal_paths.csv) | 10,000 path rows containing standalone holding distributions and correlated holding and portfolio results. |
 | [outputs/terminal_summary.csv](outputs/terminal_summary.csv) | Initial levels, units, and distribution statistics for all 36 terminal metrics. |

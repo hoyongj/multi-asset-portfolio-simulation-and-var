@@ -2,3 +2,4 @@ multi_asset_portfolio_var_mvp_brief.md
 .venv/
 __pycache__/
 *.py[cod]
+src/
